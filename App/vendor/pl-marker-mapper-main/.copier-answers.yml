@@ -1,0 +1,17 @@
+# Changes here will be overwritten by Copier
+_commit: 9ece441
+_src_path: git@github.com:pupil-labs/pl-template.git
+author_email: info@pupil-labs.com
+author_fullname: Pupil Labs GmbH
+author_username: pupil-labs
+copyright_license: MIT
+debug_module: false
+project_description: Marker Mapper
+project_name: Marker Mapper
+publish_to_pypi: true
+python_package_distribution_name: pupil-labs-marker-mapper
+python_package_import_name: marker_mapper
+repository_name: pl-marker-mapper
+repository_namespace: pupil-labs
+repository_provider: github.com
+

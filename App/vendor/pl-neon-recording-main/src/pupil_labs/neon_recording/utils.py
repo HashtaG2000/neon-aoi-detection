@@ -1,0 +1,66 @@
+from pathlib import Path
+
+import numpy as np
+from numpy.lib.recfunctions import merge_arrays
+
+from pupil_labs.neon_recording.constants import TIMESTAMP_DTYPE
+from pupil_labs.neon_recording.timeseries.array_record import Array
+
+
+def find_sorted_multipart_files(
+    recording_path: Path, basename: str, extension: str = ".raw"
+):
+    basenames_without_times = ["worn", "gaze_left", "gaze_right"]
+    file_pairs = []
+    for raw_file in recording_path.glob(f"{basename} ps*{extension}"):
+        if basename in basenames_without_times:
+            # Some sensors don't have their own .time file
+            gaze_time_stem = raw_file.stem.replace(f"{basename} ", "gaze ")
+            time_file = raw_file.parent / f"{gaze_time_stem}.time"
+
+        else:
+            time_file = raw_file.with_suffix(".time")
+
+        if time_file.exists():
+            file_pairs.append((raw_file, time_file))
+
+    return sorted(file_pairs, key=lambda pair: int(pair[0].stem[len(basename) + 3 :]))
+
+
+def load_multipart_data_time_pairs(file_pairs, dtype):
+    ts_files = [time_file for _, time_file in file_pairs]
+    data_files = [data_file for data_file, _ in file_pairs]
+
+    time_data = Array(ts_files, TIMESTAMP_DTYPE)  # type: ignore
+    if not len(time_data):
+        return np.array([], dtype=TIMESTAMP_DTYPE)
+
+    if dtype == "str":
+        data_bytes = b""
+        for data_file in data_files:
+            with open(data_file, "rb") as f:
+                data_bytes += f.read()
+
+        item_data = np.array(data_bytes.decode().splitlines())
+        item_data = item_data.view([("text", item_data.dtype)])
+    else:
+        item_data = Array(data_files, fallback_dtype=dtype)
+
+    shortest = min(len(time_data), len(item_data))
+    merged = merge_arrays([time_data[:shortest], item_data[:shortest]], flatten=True)
+    return merged
+
+
+def load_and_convert_tstamps(path: Path):
+    return np.frombuffer(path.open("rb").read(), dtype="<i8")
+
+
+def load_multipart_timestamps(files):
+    ts_buffer = b""
+    for time_file in files:
+        with open(time_file, "rb") as f:
+            ts_buffer += f.read()
+
+    timestamps = np.frombuffer(ts_buffer, dtype="<i8")
+
+    return timestamps

@@ -1,0 +1,45 @@
+# ── Participant & Test Recordings (heavy raw data) ────────────────────────────
+Recordings/
+Test recordings/
+
+# ── Pipeline outputs inside any recording folder ──────────────────────────────
+aoi_results/
+
+# ── Neon sensor data file types (raw binary, video, time files) ───────────────
+*.mp4
+*.bin
+*.raw
+*.dtype
+*.time
+*.time_aux
+*.zip
+*.proto
+
+# ── Python ────────────────────────────────────────────────────────────────────
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# ── App runtime files ─────────────────────────────────────────────────────────
+App/watcher.lock
+App/watcher.log
+App/runtime/
+App/config/settings.json
+App/config/aoi_masks.json
+App/config/aoi_masks/
+App/maintenance/
+
+# ── Editor & OS ───────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.DS_Store
+Thumbs.db
+
+# ── Claude Code internal ──────────────────────────────────────────────────────
+.claude/

@@ -1,0 +1,10 @@
+numpy
+opencv-python
+pandas
+protobuf
+pupil-apriltags
+pupil-labs-neon-recording
+pupil-labs-video
+PySide6
+pupil-labs-camera
+plotly
