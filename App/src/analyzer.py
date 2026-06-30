@@ -172,6 +172,57 @@ def _scale_polygon(poly: np.ndarray, scale: float) -> np.ndarray:
     return center + (pts - center) * scale
 
 
+
+class OpticalFlowTracker:
+    """Tracks a 2D polygon using Lucas-Kanade optical flow."""
+    def __init__(self, max_points: int = 100, quality: float = 0.05, min_dist: float = 5.0):
+        self.max_points = max_points
+        self.quality = quality
+        self.min_dist = min_dist
+        self.prev_gray = None
+        self.tracked_pts = None
+        self.prev_poly = None
+        import cv2
+        self.lk_params = dict(winSize=(21, 21), maxLevel=3, criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01))
+        
+    def reset(self):
+        self.prev_gray = None
+        self.tracked_pts = None
+        self.prev_poly = None
+        
+    def initialize(self, gray, poly):
+        import numpy as np
+        import cv2
+        mask = np.zeros_like(gray)
+        cv2.fillPoly(mask, [poly.astype(np.int32)], 255)
+        pts = cv2.goodFeaturesToTrack(gray, maxCorners=self.max_points, qualityLevel=self.quality, minDistance=self.min_dist, mask=mask)
+        if pts is not None and len(pts) >= 4:
+            self.prev_gray = gray.copy()
+            self.tracked_pts = pts
+            self.prev_poly = poly.copy()
+            return True
+        return False
+        
+    def track(self, gray):
+        import numpy as np
+        import cv2
+        if self.prev_gray is None or self.tracked_pts is None or len(self.tracked_pts) < 4: return None
+        new_pts, status, err = cv2.calcOpticalFlowPyrLK(self.prev_gray, gray, self.tracked_pts, None, **self.lk_params)
+        good_new = new_pts[status == 1]
+        good_old = self.tracked_pts[status == 1]
+        if len(good_new) < 4:
+            self.reset(); return None
+        H, _ = cv2.findHomography(good_old, good_new, cv2.RANSAC, 3.0)
+        if H is None:
+            self.reset(); return None
+        poly_reshaped = self.prev_poly.reshape(-1, 1, 2).astype(np.float32)
+        new_poly = cv2.perspectiveTransform(poly_reshaped, H).reshape(-1, 2)
+        self.prev_gray = gray.copy()
+        self.tracked_pts = good_new.reshape(-1, 1, 2)
+        self.prev_poly = new_poly
+        return new_poly
+
+
 def get_fallback_aoi_polygon(detections: list, aoi_ids: list[int]) -> np.ndarray | None:
     """Build a 2D polygon from visible markers when 3D surface mapping is not ready."""
     found_dets = [d for d in detections if d.tag_id in aoi_ids]
@@ -327,6 +378,10 @@ def analyze_recording(
     output_dir: pathlib.Path | None = None,
     *,
     clear_output: bool = True,
+    generate_video: bool = False,
+    fast_mode: bool = False,
+    trim_range: tuple[int, int] | None = None,
+    trim_padding_s: float = 0.5,
 ) -> None:
     log.info("=" * 62)
     log.info("Recording : %s", recording_dir.name)
@@ -338,6 +393,7 @@ def analyze_recording(
     detector_low  = make_detector(2.0)
     
     aois = [AOI(name, ids) for name, ids in AOI_CONFIG.items()]
+    of_trackers = {aoi.name: OpticalFlowTracker() for aoi in aois}
     try:
         mask_config: AoiMaskConfig = load_aoi_mask_config(CONFIG_DIR, SUB_AOIS_PROPORTIONS)
     except Exception as exc:
@@ -363,7 +419,20 @@ def analyze_recording(
     scene_ts   = recording.scene.time
     frames     = recording.scene.sample(scene_ts)
     gaze_samps = recording.gaze.sample(scene_ts)
-    total      = len(scene_ts)
+
+    global_start_idx = 0
+    if trim_range is not None:
+        fps_est = max(1.0, (len(scene_ts) - 1) / ((scene_ts[-1] - scene_ts[0]) / 1e9)) if len(scene_ts) > 1 else 30.0
+        pad_frames = int(round(trim_padding_s * fps_est))
+        s_idx = max(0, trim_range[0] - pad_frames)
+        e_idx = min(len(scene_ts), trim_range[1] + pad_frames + 1)
+        scene_ts = scene_ts[s_idx:e_idx]
+        frames = list(frames)[s_idx:e_idx]
+        gaze_samps = list(gaze_samps)[s_idx:e_idx]
+        global_start_idx = s_idx
+        log.info("  Trimmed analysis to frames %d-%d (padded)", s_idx, e_idx - 1)
+
+    total = len(scene_ts)
 
     fix_starts, fix_stops, fix_mean_x, fix_mean_y = load_fixations(recording)
     n_fixations = len(fix_starts)
@@ -442,10 +511,11 @@ def analyze_recording(
               + [f"{n}_visits" for n in aoi_names] + ["markers_detected"])
 
             for frame_idx, (frame, gaze) in enumerate(zip(frames, gaze_samps, strict=False)):
+                global_frame = global_start_idx + frame_idx
                 if frame_idx % 30 == 0:
                     percent = frame_idx / total * 100 if total else 0.0
-                    print(f"[{percent:5.1f}%] frame {frame_idx}/{total}")
-                    write_progress(percent, frame_idx, "processing")
+                    print(f"[{percent:5.1f}%] frame {global_frame} (local {frame_idx}/{total})")
+                    write_progress(percent, global_frame, "processing")
 
                 ts     = int(gaze.time)
                 time_s = (ts - int(scene_ts[0])) / 1e9
@@ -493,7 +563,18 @@ def analyze_recording(
                 for aoi in aois:
                     visible_tags = [d for d in detections if d.tag_id in aoi.marker_ids]
                     visible_count = len(visible_tags)
+                    
+                    # Optical flow and fallback logic
                     fallback_poly = get_fallback_aoi_polygon(detections, aoi.marker_ids)
+                    of_source = ""
+                    if fallback_poly is None:
+                        fallback_poly = of_trackers[aoi.name].track(gray_enhanced)
+                        if fallback_poly is not None:
+                            of_source = "optical_flow"
+                    else:
+                        of_trackers[aoi.name].initialize(gray_enhanced, fallback_poly)
+                        of_source = "fallback_2d"
+                        
                     if not aoi.is_initialized:
                         # To build an accurate physical model, we must see ALL tags for this AOI at least once.
                         # Otherwise, the convex hull wraps only the visible subset (e.g. half the screen).
@@ -508,6 +589,7 @@ def analyze_recording(
                         img2surface, s2i = loc
                         # Get dilated 2D boundary from 3D surface
                         boundary = get_expanded_surface_boundary(s2i, camera, scale=1.10)
+                        of_trackers[aoi.name].initialize(gray_enhanced, boundary)
                         active_polygons[aoi.name] = boundary
                         surface_xy = _surface_gaze(aoi, gx, gy, camera, img2surface)
 
@@ -557,7 +639,7 @@ def analyze_recording(
                                     row_hits[aoi.name] = True
                                     primary_aoi = region.name
                                     primary_surface = aoi.name
-                                    hit_source = f"{region.kind}_fallback_2d"
+                                    hit_source = f"{region.kind}_{of_source}" if of_source else f"{region.kind}_fallback_2d"
                                     gaze_on_aoi_x = f"{float(fallback_xy[0]):.5f}"
                                     gaze_on_aoi_y = f"{float(fallback_xy[1]):.5f}"
                                     primary_marker_count = str(visible_count)
@@ -567,7 +649,7 @@ def analyze_recording(
                             row_hits[aoi.name] = True
                             primary_aoi = aoi.name
                             primary_surface = aoi.name
-                            hit_source = f"fallback_2d_{visible_count}tag"
+                            hit_source = of_source if of_source == "optical_flow" else f"fallback_2d_{visible_count}tag"
                             if fallback_xy is not None:
                                 gaze_on_aoi_x = f"{float(fallback_xy[0]):.5f}"
                                 gaze_on_aoi_y = f"{float(fallback_xy[1]):.5f}"
@@ -614,7 +696,7 @@ def analyze_recording(
                 prev_aoi = primary_aoi
 
                 writer.writerow([
-                    ts, f"{time_s:.4f}", frame_idx, f"{gx:.2f}", f"{gy:.2f}",
+                    ts, f"{time_s:.4f}", global_frame, f"{gx:.2f}", f"{gy:.2f}",
                     is_fix, fix_id if fix_id >= 0 else "", f"{fix_dur:.1f}" if is_fix else "",
                     f"{fix_cx:.2f}" if is_fix else "", f"{fix_cy:.2f}" if is_fix else "",
                     bool(primary_aoi), primary_aoi, gaze_on_aoi_x, gaze_on_aoi_y,
@@ -641,7 +723,7 @@ def analyze_recording(
                         _draw_banner(img, f"LOOKING AT: {primary_aoi.replace('_', ' ')}", 
                                    AOI_COLORS.get(primary_aoi, DEFAULT_COLOR), vid_h, vid_w)
 
-                    _draw_frame_info(img, frame_idx, time_s)
+                    _draw_frame_info(img, global_frame, time_s)
                     video_writer.write(img)
 
         if video_writer is not None:

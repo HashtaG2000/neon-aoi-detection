@@ -29,6 +29,7 @@ build/
 # ── App runtime files ─────────────────────────────────────────────────────────
 App/watcher.lock
 App/watcher.log
+*.log
 App/runtime/
 App/config/settings.json
 App/config/aoi_masks.json
