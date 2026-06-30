@@ -3374,7 +3374,15 @@ class MainWindow(QMainWindow):
         self._edit_sources: list[str] = []
         self._undo_stack: list[tuple[list[str], list[str], int]] = []
         self._analysis_worker: Worker | None = None
-        
+
+        # Playback state + timer. Dropped during the refactor; _set_playing()
+        # reads _play_timer/_playing/_speed, so loading a recording (which calls
+        # _set_playing(False)) crashed without these.
+        self._playing = False
+        self._speed = 1.0
+        self._play_timer = QTimer(self)
+        self._play_timer.timeout.connect(self._play_tick)
+
         # State variables for new logic
         self._trim: dict[str, Any] = {}
         self._tasks: dict[str, Any] = {}
