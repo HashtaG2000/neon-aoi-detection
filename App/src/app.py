@@ -3326,10 +3326,7 @@ class CollapsibleBox(QWidget):
                 color: {Theme.TEXT};
             }}
         """)
-        self.toggle_button.setCheckable(True)
-        self.toggle_button.setChecked(False)  # False = open, True = closed? Wait, let's just make it a toggle
-        
-        # We will use text to show state: ▼ Title / ▶ Title
+        # Arrow in the text shows state: ▼ Title (open) / ▶ Title (collapsed).
         self._title = title
         self.toggle_button.setText(f"▼  {self._title}")
         self.toggle_button.clicked.connect(self.on_pressed)
@@ -3346,8 +3343,9 @@ class CollapsibleBox(QWidget):
         main_layout.addWidget(self.content_area)
 
     def on_pressed(self):
+        # Toggle: if currently hidden, show it; if currently shown, hide it.
         is_collapsed = self.content_area.isHidden()
-        self.content_area.setVisible(not is_collapsed)
+        self.content_area.setVisible(is_collapsed)
         indicator = "▼" if is_collapsed else "▶"
         self.toggle_button.setText(f"{indicator}  {self._title}")
         
