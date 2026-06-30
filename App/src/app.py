@@ -3566,6 +3566,14 @@ class MainWindow(QMainWindow):
         self._browse_rec_btn = browse_rec
         self._refresh_btn    = refresh_btn
 
+        # Apply the custom theme, connect every signal, and populate the source
+        # dropdowns. These were split into helpers during the refactor but the
+        # calls were dropped — without them the stylesheet never loads (boxy
+        # default look) and no button is connected.
+        self._apply_style()
+        self._wire()
+        self._refresh_sources()
+
     # ── Wire signals ─────────────────────────────────────────────────────────
 
     def _wire(self) -> None:
