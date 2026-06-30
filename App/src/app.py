@@ -3374,6 +3374,8 @@ class MainWindow(QMainWindow):
         self._edit_sources: list[str] = []
         self._undo_stack: list[tuple[list[str], list[str], int]] = []
         self._analysis_worker: Worker | None = None
+        # Bumped on each analysis run so stale worker callbacks are ignored.
+        self._analysis_generation = 0
 
         # Playback state + timer. Dropped during the refactor; _set_playing()
         # reads _play_timer/_playing/_speed, so loading a recording (which calls
