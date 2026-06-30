@@ -63,11 +63,10 @@ AOI_CONFIG: dict[str, list[int]] = {
 
 # (u_min, u_max, v_min, v_max) inside the normalized Screen polygon.
 # u: left -> right, v: top -> bottom.
-SUB_AOIS_PROPORTIONS = {
-    "Points_Bar":   (0.10, 0.35, 0.00, 0.16),  # top-left
-    "Progress_Bar": (0.70, 0.95, 0.00, 0.16),  # top-right
-    "Avatar":       (0.00, 0.22, 0.78, 1.00),  # bottom-left
-}
+# Points_Bar / Progress_Bar / Avatar were removed — they are not the current
+# gamification elements. Real screen task/gamification zones live in
+# App/config/screen_zones.json and are wired in as part of the surface redesign.
+SUB_AOIS_PROPORTIONS: dict[str, tuple[float, float, float, float]] = {}
 
 AOI_COLORS: dict[str, tuple[int, int, int]] = {
     "Board":       (  0, 200, 255),   # orange
@@ -76,10 +75,6 @@ AOI_COLORS: dict[str, tuple[int, int, int]] = {
     "Middle_Box":  (  0, 165, 255),   # amber
     "Right_Box":   (255, 255,   0),   # cyan
     "Screen":      (255,  80,  80),   # blue
-    
-    "Points_Bar":  (  0, 165, 255),
-    "Progress_Bar": (0, 255, 128),
-    "Avatar":      (255, 200, 100),
 }
 DEFAULT_COLOR = (180, 180, 180)
 
@@ -393,7 +388,6 @@ def analyze_recording(
     detector_low  = make_detector(2.0)
     
     aois = [AOI(name, ids) for name, ids in AOI_CONFIG.items()]
-    of_trackers = {aoi.name: OpticalFlowTracker() for aoi in aois}
     try:
         mask_config: AoiMaskConfig = load_aoi_mask_config(CONFIG_DIR, SUB_AOIS_PROPORTIONS)
     except Exception as exc:
@@ -564,16 +558,8 @@ def analyze_recording(
                     visible_tags = [d for d in detections if d.tag_id in aoi.marker_ids]
                     visible_count = len(visible_tags)
                     
-                    # Optical flow and fallback logic
+                    # Fallback logic
                     fallback_poly = get_fallback_aoi_polygon(detections, aoi.marker_ids)
-                    of_source = ""
-                    if fallback_poly is None:
-                        fallback_poly = of_trackers[aoi.name].track(gray_enhanced)
-                        if fallback_poly is not None:
-                            of_source = "optical_flow"
-                    else:
-                        of_trackers[aoi.name].initialize(gray_enhanced, fallback_poly)
-                        of_source = "fallback_2d"
                         
                     if not aoi.is_initialized:
                         # To build an accurate physical model, we must see ALL tags for this AOI at least once.
@@ -589,7 +575,6 @@ def analyze_recording(
                         img2surface, s2i = loc
                         # Get dilated 2D boundary from 3D surface
                         boundary = get_expanded_surface_boundary(s2i, camera, scale=1.10)
-                        of_trackers[aoi.name].initialize(gray_enhanced, boundary)
                         active_polygons[aoi.name] = boundary
                         surface_xy = _surface_gaze(aoi, gx, gy, camera, img2surface)
 
@@ -639,7 +624,7 @@ def analyze_recording(
                                     row_hits[aoi.name] = True
                                     primary_aoi = region.name
                                     primary_surface = aoi.name
-                                    hit_source = f"{region.kind}_{of_source}" if of_source else f"{region.kind}_fallback_2d"
+                                    hit_source = f"{region.kind}_fallback_2d"
                                     gaze_on_aoi_x = f"{float(fallback_xy[0]):.5f}"
                                     gaze_on_aoi_y = f"{float(fallback_xy[1]):.5f}"
                                     primary_marker_count = str(visible_count)
@@ -649,7 +634,7 @@ def analyze_recording(
                             row_hits[aoi.name] = True
                             primary_aoi = aoi.name
                             primary_surface = aoi.name
-                            hit_source = of_source if of_source == "optical_flow" else f"fallback_2d_{visible_count}tag"
+                            hit_source = f"fallback_2d_{visible_count}tag"
                             if fallback_xy is not None:
                                 gaze_on_aoi_x = f"{float(fallback_xy[0]):.5f}"
                                 gaze_on_aoi_y = f"{float(fallback_xy[1]):.5f}"

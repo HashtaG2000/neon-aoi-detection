@@ -1,0 +1,17 @@
+{
+  "_comment": "Gamification vs task zones on the Screen surface, in normalized [0,1] coordinates (origin top-left). Frame = display-panel rectangle (derived by rectifying assets/gamified_points.jpeg; screen corner tags 12/13/15 do not decode reliably). When the analyzer's Screen surface is defined to this same display-panel rectangle, gaze and zones share one frame. Zone LOCATIONS are fixed across gamified states (the bar fills / counter changes, but regions stay put). Status: extracted 2026-07-01, pending physical-coordinate refinement.",
+  "frame": "display_panel_normalized",
+  "source_image": "assets/gamified_points.jpeg",
+  "zones": {
+    "gamification": {
+      "Progress_Bar":  {"x0": 0.12, "y0": 0.00, "x1": 0.80, "y1": 0.14},
+      "Buddy_Speech":  {"x0": 0.67, "y0": 0.55, "x1": 0.84, "y1": 0.81},
+      "Points":        {"x0": 0.83, "y0": 0.69, "x1": 0.93, "y1": 0.79},
+      "Buddy_Avatar":  {"x0": 0.84, "y0": 0.77, "x1": 0.99, "y1": 0.96}
+    },
+    "task": {
+      "Work_Card":     {"x0": 0.16, "y0": 0.18, "x1": 0.80, "y1": 0.88},
+      "Order_Label":   {"x0": 0.57, "y0": 0.19, "x1": 0.73, "y1": 0.34}
+    }
+  }
+}

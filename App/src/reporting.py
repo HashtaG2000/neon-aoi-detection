@@ -806,9 +806,14 @@ def compare_conditions(
             ]:
                 if cand.exists() and cand.stat().st_size > 0:
                     try:
-                        df_head = pd.read_csv(cand, nrows=300)
-                        lbl = _label_series(df_head)
-                        seen.update(str(v) for v in lbl.unique() if str(v) != NONE_LABEL)
+                        # Scan the FULL label column (cheap — one column) so AOIs
+                        # that first appear late in a long recording are not missed.
+                        header = pd.read_csv(cand, nrows=0).columns
+                        col = "final_primary_aoi" if "final_primary_aoi" in header else (
+                            "primary_aoi" if "primary_aoi" in header else None)
+                        if col is not None:
+                            lbl = pd.read_csv(cand, usecols=[col])[col].map(_normalize_label)
+                            seen.update(str(v) for v in lbl.unique() if str(v) != NONE_LABEL)
                     except Exception:
                         pass
                     break

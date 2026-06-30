@@ -140,9 +140,12 @@ def _enhance(gray: np.ndarray) -> np.ndarray:
     return gray  # identity — no pre-processing, same as analyzer
 
 def _make_detector() -> pupil_apriltags.Detector:
+    # Full-resolution detection (quad_decimate=1.0) to match the analyzer's
+    # high-precision detector. Downscaling (2.0) dropped small/far tags — most
+    # notably the screen tags — so the live overlay disagreed with the analysis.
     return pupil_apriltags.Detector(
         families="tag36h11", nthreads=4,
-        quad_decimate=2.0, quad_sigma=0.0,
+        quad_decimate=1.0, quad_sigma=0.0,
         refine_edges=1, decode_sharpening=0.5,
     )
 
