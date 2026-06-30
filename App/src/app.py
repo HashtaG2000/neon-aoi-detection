@@ -921,8 +921,8 @@ class TrimPanel(QWidget):
 
         btn_row = QHBoxLayout()
         btn_row.setSpacing(6)
-        self._in_btn = QPushButton("Set In")
-        self._out_btn = QPushButton("Set Out")
+        self._in_btn = QPushButton("In")
+        self._out_btn = QPushButton("Out")
         self._clear_btn = QPushButton("Clear")
         self._clear_btn.setObjectName("iconButton")
         self._in_btn.setToolTip("Mark trim start at the current frame")
@@ -938,7 +938,7 @@ class TrimPanel(QWidget):
         self._range_lbl.setStyleSheet(f"color: {Theme.TEXT_FAINT}; font-size: 12px;")
         layout.addWidget(self._range_lbl)
         
-        self._crop_btn = QPushButton("✂ Crop CSV Data Now")
+        self._crop_btn = QPushButton("✂ Crop")
         self._crop_btn.setToolTip("Instantly remove all data outside the trimmed range from analysis.csv without re-running the slow analysis")
         self._crop_btn.setObjectName("secondaryButton")
         layout.addWidget(self._crop_btn)
@@ -1043,12 +1043,12 @@ class CorrectionPanel(QWidget):
         btn_row2 = QHBoxLayout()
         btn_row2.setSpacing(6)
         
-        self._frame_btn = QPushButton("Set Frame")
-        self._in_btn = QPushButton("Range In")
-        self._out_btn = QPushButton("Range Out")
-        self._apply_btn = QPushButton("Apply Range")
+        self._frame_btn = QPushButton("Frame")
+        self._in_btn = QPushButton("In")
+        self._out_btn = QPushButton("Out")
+        self._apply_btn = QPushButton("Apply")
         self._apply_btn.setObjectName("primaryButton")
-        self._save_btn = QPushButton("Save CSV")
+        self._save_btn = QPushButton("Save")
         
         self._frame_btn.setToolTip("Apply the selected AOI to the current frame")
         self._in_btn.setToolTip("Mark range start at the current frame")
@@ -1115,9 +1115,9 @@ class CorrectionPanel(QWidget):
         elif self._start is not None and self._end is not None:
             self._range_lbl.setText(f"Range: {self._start} → {self._end}")
         elif self._start is not None:
-            self._range_lbl.setText(f"Range in: {self._start}  (set Range Out)")
+            self._range_lbl.setText(f"In: {self._start}  (now set Out)")
         else:
-            self._range_lbl.setText(f"Range out: {self._end}  (set Range In)")
+            self._range_lbl.setText(f"Out: {self._end}  (now set In)")
 
     def active_range(self) -> tuple[Optional[int], Optional[int]]:
         return self._start, self._end
@@ -1356,12 +1356,14 @@ class DashboardWidget(QWidget):
 
         self._load_btn     = QPushButton("  Load  ")
         self._gen_btn      = QPushButton("  Rebuild  ")
-        self._png_btn      = QPushButton("📷  Save PNGs")
-        self._export_btn   = QPushButton("📗  Export Workbook")
+        self._png_btn      = QPushButton("📷  PNGs")
+        self._export_btn   = QPushButton("📗  Workbook")
 
         self._load_btn.setObjectName("primaryButton")
         self._load_btn.setToolTip("Load saved analysis for the selected recording")
         self._gen_btn.setToolTip("Force-rebuild all charts (same as Load but always regenerates)")
+        self._png_btn.setToolTip("Save every chart as a PNG image")
+        self._export_btn.setToolTip("Export all charts and tables to an Excel workbook")
 
         side_l.addWidget(QLabel("Difficulty:"))
         side_l.addWidget(self._diff_combo)
@@ -2314,7 +2316,7 @@ td{{border-bottom:1px solid rgba(255,255,255,.04)}}
         if not task_rows:
             view.setHtml(self._no_data_html(
                 "No task annotations found.<br>"
-                "Annotate tasks T1–T10 in the Studio tab and click Save Tasks."))
+                "Annotate tasks T1–T10 in the Studio tab and click Save in the Tasks section."))
             return None
         tdf = pd.DataFrame(task_rows)
         if task_filter != "All Tasks":
@@ -2804,10 +2806,12 @@ class ComparisonWidget(QWidget):
         self._cond_b_combo = QComboBox()
         self._cond_b_combo.setToolTip("Condition B (e.g. Gamified)")
 
-        self._run_btn = QPushButton("Run Comparison")
+        self._run_btn = QPushButton("Compare")
         self._run_btn.setObjectName("primaryButton")
+        self._run_btn.setToolTip("Run the statistical comparison between condition A and B")
 
-        self._png_btn = QPushButton("📷  Save PNGs")
+        self._png_btn = QPushButton("📷  PNGs")
+        self._png_btn.setToolTip("Save every comparison chart as a PNG image")
 
         side_l.addWidget(QLabel("Condition A:"))
         side_l.addWidget(self._cond_a_combo)
@@ -2821,7 +2825,7 @@ class ComparisonWidget(QWidget):
         side_l.addWidget(self._png_btn)
         side_l.addStretch(1)
 
-        self._status = QLabel("Select two conditions and click Run Comparison.")
+        self._status = QLabel("Select two conditions and click Compare.")
         self._status.setWordWrap(True)
         self._status.setStyleSheet(f"color: {Theme.TEXT_FAINT}; font-size: 12px;")
         side_l.addWidget(self._status)
@@ -3448,8 +3452,9 @@ class MainWindow(QMainWindow):
         rec_row.addWidget(refresh_btn)
         left_layout.addLayout(rec_row)
 
-        self._load_btn = QPushButton("Load Recording")
+        self._load_btn = QPushButton("Load")
         self._load_btn.setObjectName("primaryButton")
+        self._load_btn.setToolTip("Load the selected recording into the player")
         left_layout.addWidget(self._load_btn)
 
         self._analyze_btn = QPushButton("  Analyse")
@@ -3459,10 +3464,10 @@ class MainWindow(QMainWindow):
         self._analyze_btn.setEnabled(False)
         left_layout.addWidget(self._analyze_btn)
 
-        self._batch_analyze_btn = QPushButton("  Batch Re-analyse All")
+        self._batch_analyze_btn = QPushButton("  Re-analyse")
         self._batch_analyze_btn.setIcon(_svg_icon("playbutton.svg"))
         self._batch_analyze_btn.setIconSize(QSize(14, 14))
-        self._batch_analyze_btn.setToolTip("Re-run analysis on all recordings in current condition (generates new output files)")
+        self._batch_analyze_btn.setToolTip("Re-run analysis on every recording in the current condition (generates new output files)")
         self._batch_analyze_btn.setEnabled(True)
         left_layout.addWidget(self._batch_analyze_btn)
 
@@ -3513,9 +3518,10 @@ class MainWindow(QMainWindow):
         task_scroll.setWidget(self._task_panel)
         self._task_box.addWidget(task_scroll, 1)
 
-        self._save_tasks_btn = QPushButton("  Save Tasks")
+        self._save_tasks_btn = QPushButton("  Save")
         self._save_tasks_btn.setIcon(_svg_icon("export.svg"))
         self._save_tasks_btn.setIconSize(QSize(14, 14))
+        self._save_tasks_btn.setToolTip("Save task start/end annotations to disk")
         self._save_tasks_btn.setEnabled(False)
         self._task_box.addWidget(self._save_tasks_btn)
         
@@ -3523,9 +3529,10 @@ class MainWindow(QMainWindow):
 
         # ── Export ──
         self._export_box = CollapsibleBox("EXPORT")
-        self._export_btn = QPushButton("  Export Final CSV")
+        self._export_btn = QPushButton("  Export")
         self._export_btn.setIcon(_svg_icon("export.svg"))
         self._export_btn.setIconSize(QSize(14, 14))
+        self._export_btn.setToolTip("Export the corrected AOI labels and tasks to a final CSV")
         self._export_box.addWidget(self._export_btn)
         left_layout.addWidget(self._export_box)
 
@@ -3802,7 +3809,7 @@ class MainWindow(QMainWindow):
                 df.to_csv(csv_path, index=False)
                 self._status_lbl.setText(f"Saved {changes_made} corrections to analysis.csv")
                 self._correction_panel._save_btn.setText("Saved ✓")
-                QTimer.singleShot(1500, lambda: self._correction_panel._save_btn.setText("Save CSV"))
+                QTimer.singleShot(1500, lambda: self._correction_panel._save_btn.setText("Save"))
             else:
                 self._status_lbl.setText("No manual corrections to save.")
                 
@@ -4091,7 +4098,7 @@ class MainWindow(QMainWindow):
         self._tasks = self._task_panel.get_tasks()
         self._save_tasks_to_disk()
         self._save_tasks_btn.setText("  Saved ✓")
-        QTimer.singleShot(1800, lambda: self._save_tasks_btn.setText("  Save Tasks"))
+        QTimer.singleShot(1800, lambda: self._save_tasks_btn.setText("  Save"))
 
     def _load_tasks_from_disk(self) -> None:
         if self._rec_dir is None:
@@ -4233,9 +4240,9 @@ class MainWindow(QMainWindow):
             "I — Mark start of selected task at current frame<br>"
             "O — Mark end of selected task at current frame<br>"
             "<br><b>AOI Correction</b><br>"
-            "Choose an AOI, then Set Frame or mark Range In/Out and Apply Range<br>"
+            "Choose an AOI, then Frame for one frame, or mark In/Out and Apply for a range<br>"
             "<br><b>Trim</b><br>"
-            "Set In / Set Out buttons — Mark the analysis range at the current frame<br>"
+            "In / Out buttons — Mark the analysis range at the current frame<br>"
             "Clear — Remove trim, analyse the full recording"
         ))
 
