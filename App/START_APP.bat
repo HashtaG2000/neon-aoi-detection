@@ -1,5 +1,5 @@
 @echo off
-title Neon AOI Review Studio
+title AOI Studio
 
 set "APP_ROOT=%~dp0"
 set "PROJECT_ROOT=%APP_ROOT%\.."

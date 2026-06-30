@@ -1,1645 +1,4463 @@
+"""
+AOI Studio — Neon Player-inspired review tool
+==============================================
+Scene video + live AprilTag surface overlays + gaze dot.
+Two tabs: Studio (video player + task annotation) and Dashboard (Plotly charts).
+No validation video, no gamification toggle, no watcher.
+"""
 from __future__ import annotations
 
+import csv
 import json
+import math
 import pathlib
-import subprocess
-import sys
 import threading
-from dataclasses import dataclass
+import time
+from typing import Optional
 
 import cv2
 import numpy as np
 import pandas as pd
-from PySide6.QtCore import QObject, QRect, Qt, QTimer, Signal
-from PySide6.QtGui import QAction, QBrush, QColor, QIcon, QImage, QKeySequence, QPainter, QPixmap
-from PySide6.QtWebEngineWidgets import QWebEngineView
-import plotly.express as px
-from PySide6.QtWidgets import (
-    QApplication,
-    QCheckBox,
-    QComboBox,
-    QFileDialog,
-    QFrame,
-    QHBoxLayout,
-    QHeaderView,
-    QLabel,
-    QMainWindow,
-    QMessageBox,
-    QProgressBar,
-    QPushButton,
-    QSpinBox,
-    QSplitter,
-    QTableWidget,
-    QTableWidgetItem,
-    QTabWidget,
-    QVBoxLayout,
-    QWidget,
+import pupil_apriltags
+from PySide6.QtCore import (
+    QObject, QRect, QSize, Qt, QTimer, Signal,
+)
+from PySide6.QtGui import (
+    QAction, QColor, QFont, QFontDatabase, QIcon, QImage, QKeySequence,
+    QPainter, QPen, QPixmap,
 )
 
-from paths import APP_ICON, CONFIG_DIR, RECORDINGS_DIR, SRC_DIR
+from PySide6.QtWebEngineWidgets import QWebEngineView
+from PySide6.QtWidgets import (
+    QApplication, QCheckBox, QComboBox, QDialog, QDoubleSpinBox, QFileDialog,
+    QFrame, QHBoxLayout, QLabel, QMainWindow, QMessageBox,
+    QProgressBar, QPushButton, QScrollArea, QSizePolicy,
+    QSlider, QSpinBox, QSplitter, QStackedWidget, QTabWidget,
+    QVBoxLayout, QWidget,
+)
+import plotly.express as px
+import plotly.graph_objects as go
+import plotly.io as pio
+from plotly.subplots import make_subplots
 
-import locale
-import json
+from paths import (
+    AOIS_CONFIG_FILE, CONFIG_DIR, FONTS_DIR, RECORDINGS_DIR, SRC_DIR,
+    ensure_vendor_paths, list_source_folders, resolve_app_icon,
+)
 
-def get_system_lang() -> str:
-    loc, _ = locale.getlocale()
-    if loc and loc.startswith("de"):
-        return "de"
-    return "en"
+ensure_vendor_paths()
 
-LANG = get_system_lang()
+# Custom Plotly theme matching the app's dark UI (replaces the stock "plotly_dark").
+pio.templates["aoi_studio"] = pio.templates["plotly_dark"]
+pio.templates["aoi_studio"].layout.update(
+    paper_bgcolor="#0e0f11",
+    plot_bgcolor="#101113",
+    font=dict(family="Hanken Grotesk, IBM Plex Mono, sans-serif", color="#cdd0d6", size=12),
+    colorway=["#d4a24a", "#6fae7d", "#c07ba8", "#d68a55", "#5ea9b3", "#7d86c9", "#6e8fd6"],
+    title=dict(font=dict(color="#e7e8ea", size=15)),
+    xaxis=dict(gridcolor="rgba(255,255,255,.08)", linecolor="rgba(255,255,255,.08)", zerolinecolor="rgba(255,255,255,.08)"),
+    yaxis=dict(gridcolor="rgba(255,255,255,.08)", linecolor="rgba(255,255,255,.08)", zerolinecolor="rgba(255,255,255,.08)"),
+    legend=dict(font=dict(color="#cdd0d6")),
+)
 
-STRINGS = {
-    "en": {
-        "review_queue": "Review Queue",
-        "source_folder": "Source Folder (Parent)",
-        "recording_folder": "Recording Folder",
-        "choose": "Choose...",
-        "refresh": "Refresh",
-        "rerun": "Re-run detection",
-        "run_load": "Run / Load Review",
-        "category": "Category",
-        "edit_range": "Edit frame range inside selected segment",
-        "start": "Start",
-        "end": "End",
-        "apply": "Apply Range",
-        "undo": "Undo",
-        "save_draft": "Save Draft",
-        "save_final": "Save / Export Final",
-        "auto_fill": "Auto Fill Short Gaps",
-        "max_gap": "Max gap",
-        "play": "Play",
-        "dashboard": "Analytics Dashboard",
-        "review_studio": "Review Studio",
-    },
-    "de": {
-        "review_queue": "Überprüfungswarteschlange",
-        "source_folder": "Quellordner (Übergeordnet)",
-        "recording_folder": "Aufnahmeordner",
-        "choose": "Auswählen...",
-        "refresh": "Aktualisieren",
-        "rerun": "Erkennung neu starten",
-        "run_load": "Ausführen / Laden",
-        "category": "Kategorie",
-        "edit_range": "Frame-Bereich bearbeiten",
-        "start": "Start",
-        "end": "Ende",
-        "apply": "Anwenden",
-        "undo": "Rückgängig",
-        "save_draft": "Entwurf speichern",
-        "save_final": "Speichern / Export",
-        "auto_fill": "Lücken füllen",
-        "max_gap": "Max Lücke",
-        "play": "Abspielen",
-        "dashboard": "Analyse-Dashboard",
-        "review_studio": "Überprüfungsstudio",
-    }
+import pupil_labs.neon_recording as nr
+import reporting
+
+
+def _svg_icon(name: str) -> QIcon:
+    """Load an SVG from the assets folder as a QIcon."""
+    return QIcon(str(SRC_DIR / "assets" / name))
+
+APP_TITLE = "AOI Studio"
+
+_COND_COLORS      = ["#6e8fd6", "#6b6e74"]           # A = accent, B = neutral grey
+_COND_FILL_COLORS = ["rgba(110,143,214,0.15)", "rgba(107,110,116,0.15)"]
+
+# ─── AOI palette ─────────────────────────────────────────────────────────────
+
+def _load_aoi_config() -> tuple[dict[str, list[int]], dict[str, tuple]]:
+    data = json.loads(AOIS_CONFIG_FILE.read_text(encoding="utf-8"))
+    aois   = {k: list(v) for k, v in data["aois"].items()}
+    colors = {k: tuple(v) for k, v in data["colors"].items()}
+    return aois, colors
+
+AOI_CONFIG, _CV_COLORS = _load_aoi_config()
+
+# Qt colors (for timeline + UI)
+AOI_COLORS_QT: dict[str, QColor] = {
+    name: QColor(r, g, b)
+    for name, (b, g, r) in _CV_COLORS.items()   # aois.json stores BGR
 }
+# cv2 colors (for drawing on frame)
+AOI_COLORS_CV: dict[str, tuple] = _CV_COLORS     # already BGR
 
-def tr(key: str) -> str:
-    return STRINGS.get(LANG, STRINGS["en"]).get(key, key)
+NONE_LABEL = "NoAOI"
+AOI_NAMES  = list(AOI_CONFIG.keys())
+EDITABLE_AOIS = AOI_NAMES + [NONE_LABEL]
+GAP_FILL_MAX_FRAMES = 15
 
-APP_TITLE = "Neon AOI Review Studio"
-NONE_LABEL = "None"
-RAW_NONE_LABEL = "NoAOI"
+# ─── Theme tokens (from the Claude Design "AOI Studio v2" handoff) ────────────
 
-AOI_NAMES = [
-    "Board",
-    "Left_Box",
-    "Middle_Box",
-    "Right_Box",
-    "Screen",
-    "Stream_Deck",
-    "Points_Bar",
-    "Progress_Bar",
-    "Avatar",
-    NONE_LABEL,
-]
-
-AOI_COLORS = {
-    "Board": QColor("#F6AD55"),
-    "Left_Box": QColor("#48BB78"),
-    "Middle_Box": QColor("#ED8936"),
-    "Right_Box": QColor("#38B2AC"),
-    "Screen": QColor("#4299E1"),
-    "Stream_Deck": QColor("#D53F8C"),
-    "Points_Bar": QColor("#ECC94B"),
-    "Progress_Bar": QColor("#68D391"),
-    "Avatar": QColor("#9F7AEA"),
-    NONE_LABEL: QColor("#718096"),
-}
-
-HELPER_AOI_COLUMNS = {
-    "any_aoi_hit",
-    "final_any_aoi_hit",
-}
-HELPER_AOI_LABELS = {
-    "any_aoi",
-    "any_aoi_hit",
-    "final_any_aoi_hit",
-}
+class Theme:
+    BG_BASE        = "#0e0f11"
+    BG_PANEL       = "#121315"   # sidebars
+    BG_FIELD       = "#131416"   # filled buttons / inputs
+    BG_CARD        = "#101113"   # tables / chart containers
+    BORDER         = "rgba(255,255,255,.10)"
+    BORDER_SUBTLE  = "rgba(255,255,255,.07)"
+    BORDER_FAINT   = "rgba(255,255,255,.04)"
+    TEXT           = "#e7e8ea"
+    TEXT_BRIGHT    = "#f1f2f4"
+    TEXT_SECONDARY = "#cdd0d6"
+    TEXT_MUTED     = "#9b9ea4"
+    TEXT_DIM       = "#83868c"
+    TEXT_FAINT     = "#6a6d73"
+    TEXT_VFAINT    = "#62656b"
+    ACCENT         = "#6e8fd6"
+    SUCCESS        = "#6fae7d"
+    WARNING        = "#d4a24a"
+    DANGER         = "#cf6b6b"
+    RADIUS         = 8
+    FONT_UI        = "Hanken Grotesk"
+    FONT_MONO      = "IBM Plex Mono"
 
 
-def to_ui_label(value: object) -> str:
-    if pd.isna(value):
-        return NONE_LABEL
-    label = str(value).strip()
-    if not label or label == RAW_NONE_LABEL:
-        return NONE_LABEL
-    return label
+def _load_app_fonts() -> None:
+    """Register the bundled Hanken Grotesk / IBM Plex Mono weights with Qt."""
+    if not FONTS_DIR.exists():
+        return
+    for ttf in sorted(FONTS_DIR.glob("*.ttf")):
+        QFontDatabase.addApplicationFont(str(ttf))
 
+# ─── Detection helpers ────────────────────────────────────────────────────────
 
-@dataclass(frozen=True)
-class Segment:
-    aoi: str
-    start: int
-    end: int
+# Bug 10 fix: CLAHE removed from live detection. The analyzer uses raw frames
+# (no CLAHE) so the live overlay must match to avoid showing different results.
+# The old _clahe / _enhance function caused the live view to detect surfaces
+# that the analyzer did not (or vice versa).
 
+def _enhance(gray: np.ndarray) -> np.ndarray:
+    return gray  # identity — no pre-processing, same as analyzer
+
+def _make_detector() -> pupil_apriltags.Detector:
+    return pupil_apriltags.Detector(
+        families="tag36h11", nthreads=4,
+        quad_decimate=2.0, quad_sigma=0.0,
+        refine_edges=1, decode_sharpening=0.5,
+    )
+
+def _surface_polygon(detections: list, marker_ids: list[int]) -> Optional[np.ndarray]:
+    """Convex hull of all visible marker corners for this surface."""
+    visible = [d for d in detections if d.tag_id in marker_ids]
+    if not visible:
+        return None
+    corners = []
+    for d in visible:
+        corners.extend(d.corners)
+    hull = cv2.convexHull(np.array(corners, dtype=np.float32))
+    return hull.reshape(-1, 2)
+
+def _bgr_to_pixmap(bgr: np.ndarray, max_w: int, max_h: int) -> QPixmap:
+    h, w = bgr.shape[:2]
+    scale = min(max_w / max(w, 1), max_h / max(h, 1), 1.0)
+    if scale < 0.99:
+        bgr = cv2.resize(bgr, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
+    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+    h2, w2 = rgb.shape[:2]
+    qi = QImage(rgb.data, w2, h2, 3 * w2, QImage.Format_RGB888).copy()
+    return QPixmap.fromImage(qi)
+
+# ─── Worker signals ───────────────────────────────────────────────────────────
 
 class WorkerSignals(QObject):
-    status = Signal(str)
-    loaded = Signal(pathlib.Path)
-    exported = Signal(pathlib.Path)
-    failed = Signal(str)
-    analysis_finished = Signal()
+    progress = Signal(int, int)   # (current_frame, total_frames)
+    status   = Signal(str)
+    finished = Signal()
+    failed   = Signal(str)
 
 
-class VideoLabel(QLabel):
+class AnalysisWorker(threading.Thread):
+    def __init__(
+        self,
+        rec_dir: pathlib.Path,
+        trim: Optional[dict] = None,
+        *,
+        generate_video: bool = False,
+        generation: int = 0,
+    ) -> None:
+        super().__init__(daemon=True)
+        self.rec_dir = rec_dir
+        self.trim = trim or {}
+        self.generate_video = generate_video
+        self.generation = generation
+        self.signals = WorkerSignals()
+
+    def run(self) -> None:
+        try:
+            import analyzer
+            self.signals.status.emit("Analyzing…")
+            raw_dir = self.rec_dir / "aoi_results" / "raw"
+            start_frame = self.trim.get("start_frame")
+            end_frame   = self.trim.get("end_frame")
+            trim_range  = (start_frame, end_frame) if start_frame is not None and end_frame is not None else None
+            padding_s   = float(self.trim.get("padding_s", 0.5))
+            analyzer.analyze_recording(
+                self.rec_dir, raw_dir, generate_video=self.generate_video,
+                trim_range=trim_range, trim_padding_s=padding_s,
+            )
+            self.signals.finished.emit()
+        except Exception as exc:
+            self.signals.failed.emit(f"{type(exc).__name__}: {exc}")
+
+
+class BatchAnalysisWorker(threading.Thread):
+    def __init__(self, source_dir: pathlib.Path, generation: int = 0) -> None:
+        super().__init__(daemon=True)
+        self.source_dir = source_dir
+        self.generation = generation
+        self.signals = WorkerSignals()
+
+    def run(self) -> None:
+        try:
+            import analyzer
+            recordings = sorted([d for d in self.source_dir.iterdir() if d.is_dir()])
+            total = len(recordings)
+            for idx, rec_dir in enumerate(recordings, 1):
+                self.signals.status.emit(f"Analysing {idx}/{total}: {rec_dir.name}")
+                raw_dir = rec_dir / "aoi_results" / "raw"
+                # Force re-analysis by removing lock file
+                lock = raw_dir / ".processing"
+                lock.unlink(missing_ok=True)
+                try:
+                    analyzer.analyze_recording(rec_dir, raw_dir, generate_video=False)
+                except Exception as e:
+                    self.signals.status.emit(f"Failed {rec_dir.name}: {e}")
+            self.signals.finished.emit()
+        except Exception as exc:
+            self.signals.failed.emit(f"{type(exc).__name__}: {exc}")
+
+
+class ComparisonWorker(threading.Thread):
+    def __init__(self, cond_a: pathlib.Path, cond_b: pathlib.Path) -> None:
+        super().__init__(daemon=True)
+        self.cond_a  = cond_a
+        self.cond_b  = cond_b
+        self.signals = WorkerSignals()
+        self.result  = None   # ComparisonReport set on success
+
+    def run(self) -> None:
+        try:
+            self.result = reporting.compare_conditions(self.cond_a, self.cond_b)
+            self.signals.finished.emit()
+        except Exception as exc:
+            self.signals.failed.emit(f"{type(exc).__name__}: {exc}")
+
+
+# ─── Video widget ─────────────────────────────────────────────────────────────
+
+class VideoWidget(QLabel):
+    """
+    Center piece of the Studio tab.
+    Renders the scene video frame with:
+      - Live AprilTag surface-boundary polygons
+      - Gaze dot (from recording.gaze)
+    """
+    frameChanged = Signal(int)
+
     def __init__(self) -> None:
         super().__init__()
         self.setAlignment(Qt.AlignCenter)
-        self.setMinimumHeight(340)
+        self.setMinimumSize(480, 360)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.setStyleSheet(
-            "background: #111827; border-radius: 8px; color: #E5E7EB;"
+            f"background: #14151a; border: 1px solid rgba(255,255,255,.06); "
+            f"border-radius: {Theme.RADIUS}px; color: {Theme.TEXT_VFAINT}; "
+            f"font-family: '{Theme.FONT_MONO}', monospace;"
         )
-        self.setText("Load a recording to review the validation video.")
+        self.setText("scene camera + gaze overlay")
+
+        self._recording: Optional[nr.NeonRecording] = None
+        self._scene_ts: Optional[np.ndarray] = None
+        self._n_frames: int = 0
+        self._frame_idx: int = 0
+        self._detector = _make_detector()
+        self._show_surfaces: bool = True
+        self._show_gaze: bool = True
+        self._playing: bool = False
+        self._cap: Optional[cv2.VideoCapture] = None   # fast sequential reader
+
+    # ── Public API ──────────────────────────────────────────────────────────
+
+    def load(self, recording: nr.NeonRecording, rec_dir: pathlib.Path) -> None:
+        self._recording = recording
+        self._scene_ts  = recording.scene.time
+        self._n_frames  = len(self._scene_ts)
+        self._frame_idx = 0
+        self._open_cap(rec_dir)
+        self.render()
+
+    def _open_cap(self, rec_dir: pathlib.Path) -> None:
+        if self._cap is not None:
+            self._cap.release()
+            self._cap = None
+        scene_candidates = sorted(rec_dir.glob("*Scene Camera*.mp4"))
+        other_candidates = sorted(p for p in rec_dir.glob("*.mp4") if p not in scene_candidates)
+        for p in scene_candidates + other_candidates:
+            cap = cv2.VideoCapture(str(p))
+            if cap.isOpened():
+                self._cap = cap
+                return
+
+    def unload(self) -> None:
+        if self._cap is not None:
+            self._cap.release()
+            self._cap = None
+        self._recording = None
+        self._scene_ts  = None
+        self._n_frames  = 0
+        self._frame_idx = 0
+        self.clear()
+        self.setText("Load a recording to begin.")
+
+    def seek(self, idx: int) -> None:
+        if self._n_frames == 0:
+            return
+        self._frame_idx = max(0, min(idx, self._n_frames - 1))
+        # Force cap to correct position on explicit seeks
+        if self._cap is not None:
+            self._cap.set(cv2.CAP_PROP_POS_FRAMES, self._frame_idx)
+        self.render()
+        self.frameChanged.emit(self._frame_idx)
+
+    def play_step(self) -> bool:
+        """Advance one frame during playback. Returns False if at end."""
+        if self._frame_idx >= self._n_frames - 1:
+            return False
+        self._frame_idx += 1
+        self.render()
+        self.frameChanged.emit(self._frame_idx)
+        return True
+
+    def step(self, delta: int) -> None:
+        self.seek(self._frame_idx + delta)
+
+    @property
+    def frame_idx(self) -> int:
+        return self._frame_idx
+
+    @property
+    def n_frames(self) -> int:
+        return self._n_frames
+
+    def set_playing(self, playing: bool) -> None:
+        self._playing = playing
+
+    # ── Rendering ───────────────────────────────────────────────────────────
+
+    def render(self) -> None:
+        if self._n_frames == 0:
+            return
+        try:
+            bgr = self._read_frame(self._frame_idx)
+            if bgr is None:
+                return
+            ts = self._scene_ts[self._frame_idx]
+            if self._show_surfaces:
+                self._draw_surfaces(bgr)
+            if not self._playing:
+                self._draw_fixation_scanpath(bgr, ts)
+            self._draw_gaze(bgr, ts)
+            self._draw_hud(bgr)
+            pixmap = _bgr_to_pixmap(bgr, self.width() - 4, self.height() - 4)
+            self.setPixmap(pixmap)
+        except Exception as exc:
+            self.setText(f"Render error: {exc}")
+
+    def _read_frame(self, idx: int) -> Optional[np.ndarray]:
+        """Fast sequential read during playback; seek only when needed."""
+        if self._cap is not None:
+            if self._playing:
+                # During playback: just read the next frame sequentially — never seek
+                ret, frame = self._cap.read()
+                if ret:
+                    return frame
+            else:
+                cap_pos = int(self._cap.get(cv2.CAP_PROP_POS_FRAMES))
+                if cap_pos != idx:
+                    self._cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+                ret, frame = self._cap.read()
+                if ret:
+                    return frame
+        # Fallback to NeonRecording (slower)
+        if self._recording is not None:
+            ts    = self._scene_ts[idx]
+            frame = self._recording.scene.sample([ts], method="backward")[0]
+            return np.array(frame.bgr, copy=True)
+        return None
+
+    def _draw_surfaces(self, bgr: np.ndarray) -> None:
+        if not self._show_surfaces or self._playing:
+            return
+        gray       = _enhance(cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY))
+        detections = self._detector.detect(gray)
+        for name, ids in AOI_CONFIG.items():
+            poly = _surface_polygon(detections, ids)
+            if poly is None:
+                continue
+            color = AOI_COLORS_CV.get(name, (180, 180, 180))
+            pts = poly.astype(np.int32).reshape(-1, 1, 2)
+            cv2.polylines(bgr, [pts], isClosed=True, color=color, thickness=2, lineType=cv2.LINE_AA)
+            cx = int(poly[:, 0].mean())
+            cy = int(poly[:, 1].mean())
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            (tw, th), _ = cv2.getTextSize(name, font, 0.50, 1)
+            cv2.rectangle(bgr, (cx - 3, cy - th - 5), (cx + tw + 3, cy + 3), (0, 0, 0), -1)
+            cv2.putText(bgr, name, (cx, cy), font, 0.50, color, 1, cv2.LINE_AA)
+
+    def _draw_gaze(self, bgr: np.ndarray, ts_ns: int) -> None:
+        if not self._show_gaze:
+            return
+        try:
+            g  = self._recording.gaze.sample([ts_ns], method="nearest")[0]
+            gx, gy = float(g.point_x), float(g.point_y)
+            if not (np.isfinite(gx) and np.isfinite(gy)):
+                return
+            px, py = int(gx), int(gy)
+            cv2.circle(bgr, (px, py), 14, (0, 0, 200), -1, cv2.LINE_AA)
+            cv2.circle(bgr, (px, py), 14, (255, 255, 255), 2, cv2.LINE_AA)
+            cv2.circle(bgr, (px, py),  4, (255, 255, 255), -1, cv2.LINE_AA)
+        except Exception:
+            pass
+
+    def _draw_fixation_scanpath(self, bgr: np.ndarray, ts_ns: int) -> None:
+        """Draw scanpath (connected circles) and active fixation circle.
+        Ported from Neon Player's ScanpathViz + FixationCircleViz.
+        Only called when paused — not during playback.
+        """
+        if self._recording is None:
+            return
+        try:
+            fd      = self._recording.fixations.data
+            starts  = np.asarray(fd["start_time"],  dtype=np.int64)
+            stops   = np.asarray(fd["stop_time"],   dtype=np.int64)
+            mean_x  = np.asarray(fd["mean_gaze_x"], dtype=np.float64)
+            mean_y  = np.asarray(fd["mean_gaze_y"], dtype=np.float64)
+        except Exception:
+            return
+
+        # Last 7 completed fixations + current active fixation
+        history_ns  = 30_000_000_000  # 30s history window
+        past_mask   = (stops  <= ts_ns) & (stops  >= ts_ns - history_ns)
+        active_mask = (starts <= ts_ns) & (stops  >  ts_ns)
+        past_idx    = np.where(past_mask)[0]
+        if len(past_idx) > 7:
+            past_idx = past_idx[-7:]
+        active_idx  = np.where(active_mask)[0]
+        render_idx  = np.sort(np.concatenate([past_idx, active_idx]))
+
+        if len(render_idx) == 0:
+            return
+
+        prev_pt = None
+        for idx in render_idx:
+            cx  = int(mean_x[idx])
+            cy  = int(mean_y[idx])
+            dur_ms  = (int(stops[idx]) - int(starts[idx])) / 1e6
+            radius  = min(80, max(10, int(10 * dur_ms / 100.0)))
+            is_active = len(active_idx) > 0 and idx == active_idx[0]
+
+            # Scanpath line between successive fixations
+            if prev_pt is not None:
+                cv2.line(bgr, prev_pt, (cx, cy), (90, 104, 110), 2, cv2.LINE_AA)
+            prev_pt = (cx, cy)
+
+            # Circle: filled amber if active, outlined grey if past
+            if is_active:
+                cv2.circle(bgr, (cx, cy), radius, (0, 200, 255), -1, cv2.LINE_AA)
+                cv2.circle(bgr, (cx, cy), radius, (255, 255, 255), 2, cv2.LINE_AA)
+            else:
+                cv2.circle(bgr, (cx, cy), radius, (90, 104, 110), 2, cv2.LINE_AA)
+
+            # Fixation ID label (white, small)
+            label = str(int(idx) + 1)
+            (tw, _), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.4, 1)
+            cv2.putText(bgr, label, (cx - tw // 2, cy + 5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1, cv2.LINE_AA)
+
+    def _draw_hud(self, bgr: np.ndarray) -> None:
+        h, w = bgr.shape[:2]
+        ts_s = (self._scene_ts[self._frame_idx] - self._scene_ts[0]) / 1e9 if self._n_frames else 0
+        label = f"{self._frame_idx:05d}  {ts_s:6.2f}s"
+        cv2.putText(bgr, label, (10, h - 10), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.45, (0, 0, 0), 3, cv2.LINE_AA)
+        cv2.putText(bgr, label, (10, h - 10), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.45, (200, 200, 200), 1, cv2.LINE_AA)
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        # Bug 9 fix: debounce renders during drag-resize.  Without this,
+        # every pixel of window movement triggers a full render (including
+        # AprilTag detection), making the UI feel sluggish.
+        if not hasattr(self, '_resize_timer'):
+            self._resize_timer = QTimer(self)
+            self._resize_timer.setSingleShot(True)
+            self._resize_timer.setInterval(100)  # ms
+            self._resize_timer.timeout.connect(self.render)
+        self._resize_timer.start()
 
 
-class TimelineWidget(QWidget):
-    frameSelected = Signal(int)
+# ─── Playback controls ────────────────────────────────────────────────────────
+
+class PlaybackBar(QWidget):
+    seeked = Signal(int)   # absolute frame index
 
     def __init__(self) -> None:
         super().__init__()
-        self.labels: list[str] = []
-        self.current_frame = 0
-        self.is_scrubbing = False
-        self.aoi_names: list[str] = list(AOI_NAMES)
-        self.setMinimumHeight(270)
+        self.setFixedHeight(40)
+        self._n_frames = 0
+        self._fps      = 30.0
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(8, 2, 8, 2)
+        layout.setSpacing(8)
+
+        # Step back 30 frames (~1 s)
+        self.prev_btn = QPushButton()
+        self.prev_btn.setIcon(_svg_icon("arrow_back.svg"))
+        self.prev_btn.setIconSize(QSize(16, 16))
+        self.prev_btn.setFixedWidth(36)
+        self.prev_btn.setObjectName("iconButton")
+        self.prev_btn.setToolTip("Step back 1 second")
+
+        self.play_btn = QPushButton()
+        self.play_btn.setIcon(_svg_icon("playbutton.svg"))
+        self.play_btn.setIconSize(QSize(18, 18))
+        self.play_btn.setFixedWidth(40)
+        self.play_btn.setObjectName("primaryButton")
+
+        # Step forward 30 frames (~1 s)
+        self.next_btn = QPushButton()
+        self.next_btn.setIcon(_svg_icon("arrow_forward.svg"))
+        self.next_btn.setIconSize(QSize(16, 16))
+        self.next_btn.setFixedWidth(36)
+        self.next_btn.setObjectName("iconButton")
+        self.next_btn.setToolTip("Step forward 1 second")
+
+        self.slider = QSlider(Qt.Horizontal)
+        self.slider.setRange(0, 0)
+
+        self.time_label = QLabel("0:00:00 / 0:00:00")
+        self.time_label.setFixedWidth(120)
+        self.time_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.time_label.setStyleSheet(f"color: {Theme.TEXT_MUTED}; font-size: 13px; font-family: '{Theme.FONT_MONO}', monospace;")
+
+        layout.addWidget(self.prev_btn)
+        layout.addWidget(self.play_btn)
+        layout.addWidget(self.next_btn)
+        layout.addWidget(self.slider, 1)
+        layout.addWidget(self.time_label)
+
+        self.slider.valueChanged.connect(self.seeked)
+
+    def configure(self, n_frames: int, fps: float) -> None:
+        self._n_frames = n_frames
+        self._fps = max(fps, 1.0)
+        self.slider.setRange(0, max(0, n_frames - 1))
+        self._update_time(0)
+
+    def set_frame(self, idx: int) -> None:
+        self.slider.blockSignals(True)
+        self.slider.setValue(idx)
+        self.slider.blockSignals(False)
+        self._update_time(idx)
+
+    def set_playing(self, playing: bool) -> None:
+        self.play_btn.setIcon(_svg_icon("pause.svg" if playing else "playbutton.svg"))
+
+    def _update_time(self, idx: int) -> None:
+        def fmt(s: float) -> str:
+            h = int(s) // 3600
+            m = (int(s) % 3600) // 60
+            sec = int(s) % 60
+            return f"{h}:{m:02d}:{sec:02d}" if h else f"{m:02d}:{sec:02d}"
+        cur = idx / self._fps
+        tot = self._n_frames / self._fps
+        self.time_label.setText(f"{fmt(cur)} / {fmt(tot)}")
+
+
+# ─── Combined timeline (AOI + gaze + fixations + tasks) ──────────────────────
+
+class AOITimeline(QWidget):
+    """
+    Stacked timeline rows (Neon Player style):
+      Row 1 – AOI label colour bar (coloured segments per AOI)
+      Row 2 – Gaze presence strip  (white = gaze detected, dark = no gaze/blink)
+      Row 3 – Fixation markers     (bright dots where fixations occur)
+      Row 4 – Task spans           (coloured bands per task)
+    """
+    frameClicked = Signal(int)
+
+    _ROW_AOI      = 18
+    _ROW_GAZE     = 10
+    _ROW_FIX      = 10
+    _ROW_TASKS    = 20
+    _PAD          = 2
+    _LEFT_MARGIN  = 44   # pixels reserved on the left for row labels
+
+    def __init__(self) -> None:
+        super().__init__()
+        h = (self._ROW_AOI + self._ROW_GAZE + self._ROW_FIX +
+             self._ROW_TASKS + self._PAD * 3)
+        self.setMinimumHeight(h)
+        self.resize(self.width(), h)
         self.setMouseTracking(True)
-        self.tasks_data = {}
 
+        self._n_frames:    int        = 0
+        self._labels:      list[str]  = []
+        self._gaze_x:      np.ndarray = np.array([])
+        self._gaze_y:      np.ndarray = np.array([])
+        self._fix_frames:  list[int]  = []
+        self._frame_idx:   int        = 0
+        self._tasks:       dict       = {}
 
-    def set_aoi_names(self, aoi_names: list[str]) -> None:
-        self.aoi_names = list(aoi_names) or list(AOI_NAMES)
-        self.setMinimumHeight(max(270, 25 * len(self.aoi_names) + 70))
+        # Zoom/pan: the visible frame window. (0, 0) means "not set yet" —
+        # _visible_range() falls back to the full recording.
+        self._view_start:      int   = 0
+        self._view_end:        int   = 0
+        self._drag_active:     bool  = False
+        self._drag_start_x:    float = 0.0
+        self._drag_start_view: tuple[int, int] = (0, 0)
+
+        # Static-content cache — rebuilt only when data changes, not on every tick
+        self._cache:       Optional[QPixmap] = None
+        self._cache_dirty: bool              = True
+
+    # ── Public API ──────────────────────────────────────────────────────────
+
+    def set_recording_length(self, n: int) -> None:
+        self._n_frames    = n
+        self._view_start  = 0
+        self._view_end    = n
+        self._cache_dirty = True
         self.update()
 
-
-    def set_tasks(self, tasks_data: dict) -> None:
-        self.tasks_data = tasks_data
+    def set_analysis(self, labels: list[str],
+                     gaze_x: np.ndarray, gaze_y: np.ndarray,
+                     fix_frames: list[int]) -> None:
+        self._labels      = labels
+        self._gaze_x      = gaze_x
+        self._gaze_y      = gaze_y
+        self._fix_frames  = fix_frames
+        self._cache_dirty = True
         self.update()
 
-    def set_data(self, labels: list[str], current_frame: int) -> None:
-        self.labels = labels
-        self.current_frame = current_frame
+    def set_tasks(self, tasks: dict) -> None:
+        self._tasks       = tasks
+        self._cache_dirty = True
         self.update()
+
+    def set_frame(self, idx: int) -> None:
+        self._frame_idx = idx
+        # Auto-follow: if zoomed in and the playhead leaves the visible
+        # window (e.g. during playback), slide the window to keep it in view.
+        vs, ve = self._visible_range()
+        width = ve - vs
+        if width < self._n_frames and not (vs <= idx <= ve):
+            new_start = max(0, idx) if idx < vs else min(self._n_frames - width, idx - width)
+            self._view_start = int(new_start)
+            self._view_end   = int(new_start + width)
+            self._cache_dirty = True
+        self.update()   # fast: blit cache + draw playhead only
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._cache_dirty = True
+        self.update()
+
+    # ── Zoom / pan ───────────────────────────────────────────────────────────
+
+    def _visible_range(self) -> tuple[int, int]:
+        if self._view_end <= self._view_start:
+            return 0, max(1, self._n_frames)
+        return self._view_start, self._view_end
+
+    def wheelEvent(self, event) -> None:
+        if self._n_frames <= 0:
+            return
+        lx = self._LEFT_MARGIN
+        tw = max(1, self.width() - lx)
+        vs, ve = self._visible_range()
+        view_w = ve - vs
+        ratio = max(0.0, min(1.0, (event.position().x() - lx) / tw))
+        frame_at_cursor = vs + ratio * view_w
+
+        factor = 1.25
+        new_width = view_w / factor if event.angleDelta().y() > 0 else view_w * factor
+        min_width = min(60, self._n_frames)   # don't zoom in past ~2s
+        new_width = max(min_width, min(self._n_frames, new_width))
+
+        new_start = max(0, min(self._n_frames - new_width, frame_at_cursor - ratio * new_width))
+        self._view_start = int(round(new_start))
+        self._view_end   = int(round(new_start + new_width))
+        self._cache_dirty = True
+        self.update()
+        event.accept()
+
+    def mouseDoubleClickEvent(self, event) -> None:
+        self._view_start = 0
+        self._view_end   = self._n_frames
+        self._cache_dirty = True
+        self.update()
+
+    # ── Paint ───────────────────────────────────────────────────────────────
 
     def paintEvent(self, _event) -> None:
+        w = self.width()
+        h = self.height()
+
+        # Rebuild the static cache if data changed or widget was resized
+        if self._cache_dirty or self._cache is None:
+            self._cache = self._build_cache(w, h)
+            self._cache_dirty = False
+
         painter = QPainter(self)
+        # Blit static cache (fast GPU copy — does NOT iterate over frames)
+        painter.drawPixmap(0, 0, self._cache)
+
+        # Draw moving playhead only inside the data area (right of label margin),
+        # and only when it falls within the currently zoomed/panned view.
+        lx = self._LEFT_MARGIN
+        tw = max(1, w - lx)
+        vs, ve = self._visible_range()
+        view_w = max(1, ve - vs)
+        if vs <= self._frame_idx <= ve:
+            cx = lx + int((self._frame_idx - vs) / view_w * tw)
+            painter.setPen(QPen(QColor(Theme.DANGER), 1))
+            painter.drawLine(cx, 0, cx, h)
+
+    def _build_cache(self, w: int, h: int) -> QPixmap:
+        """Render all static rows into a QPixmap (called once per data change)."""
+        px = QPixmap(max(w, 1), max(h, 1))
+        px.fill(QColor(Theme.BG_BASE))
+        if w <= 0 or h <= 0:
+            return px
+
+        painter = QPainter(px)
         painter.setRenderHint(QPainter.Antialiasing)
-        painter.fillRect(self.rect(), QColor("#0D1117"))
 
-        if not self.labels:
-            painter.setPen(QColor("#64748B"))
-            painter.drawText(20, 32, "Timeline appears after analysis is loaded.")
-            return
+        lx    = self._LEFT_MARGIN          # left edge of data area
+        tw    = max(1, w - lx)             # width of data area
+        vs, ve = self._visible_range()
+        view_w = max(1, ve - vs)
 
-        label_w = 118
-        top = 14
-        row_h = 25
-        usable_w = max(1, self.width() - label_w - 16)
-        total = max(1, len(self.labels))
+        def fx(frame_i: float) -> int:
+            """Map a frame index to an x pixel through the current zoom/pan window."""
+            return lx + int((frame_i - vs) / view_w * tw)
 
-        for row_idx, aoi in enumerate(self.aoi_names):
-            y = top + row_idx * row_h
-            painter.setPen(QColor("#E1E4E8"))
-            painter.drawText(10, y + 17, aoi)
-            painter.setPen(Qt.NoPen)
-            painter.setBrush(QColor("#21262D"))
-            painter.drawRoundedRect(QRect(label_w, y + 4, usable_w, row_h - 8), 4, 4)
-            self._paint_segments(painter, aoi, label_w, y + 4, usable_w, row_h - 8, total)
+        p       = self._PAD
 
+        # Row heights scale with the widget's actual height (resizable via the
+        # Studio splitter) while keeping the original AOI:Gaze:Fix:Tasks ratio.
+        weights  = (self._ROW_AOI, self._ROW_GAZE, self._ROW_FIX, self._ROW_TASKS)
+        avail    = max(4 * 6, h - p * 3)
+        total_w  = sum(weights)
+        row_aoi, row_gaze, row_fix = (max(6, int(avail * wt / total_w)) for wt in weights[:3])
+        row_task = max(8, avail - row_aoi - row_gaze - row_fix)
 
-        # Draw task segments below AOI rows
-        task_y = top + len(self.aoi_names) * row_h + 8
-        painter.setPen(QColor("#8B949E"))
-        painter.drawText(10, task_y + 12, "TASKS")
-        for tname, tdata in self.tasks_data.items():
-            start = tdata.get("start")
-            end = tdata.get("end")
-            if start is not None and end is not None and end > start:
-                x1 = label_w + int((start / total) * usable_w)
-                x2 = label_w + max(1, int((end / total) * usable_w))
-                painter.setBrush(QColor("#1F6FEB"))
-                painter.setPen(Qt.NoPen)
-                painter.drawRoundedRect(QRect(x1, task_y, x2 - x1, 14), 4, 4)
-                painter.setPen(QColor("#FFFFFF"))
-                painter.drawText(QRect(x1, task_y, x2 - x1, 14), Qt.AlignCenter, tname)
+        y0_aoi  = 0
+        y0_gaze = y0_aoi  + row_aoi  + p
+        y0_fix  = y0_gaze + row_gaze + p
+        y0_task = y0_fix  + row_fix  + p
 
-        cursor_x = label_w + int((self.current_frame / total) * usable_w)
-        painter.setPen(QColor("#EF4444"))
-        painter.drawLine(cursor_x, top, cursor_x, top + len(self.aoi_names) * row_h)
+        # ── Row labels (left margin) ─────────────────────────────────────────
+        label_font = QFont(Theme.FONT_UI, 7)
+        label_color = QColor("#73767c")
+        painter.setFont(label_font)
+        painter.setPen(label_color)
+        lm = lx - 3  # right-align text just before the data area
+        for text, y0, row_h in [
+            ("AOI",   y0_aoi,  row_aoi),
+            ("Gaze",  y0_gaze, row_gaze),
+            ("Fix",   y0_fix,  row_fix),
+            ("Tasks", y0_task, row_task),
+        ]:
+            painter.drawText(QRect(0, y0, lm, row_h), Qt.AlignVCenter | Qt.AlignRight, text)
 
-    def _paint_segments(
-        self,
-        painter: QPainter,
-        aoi: str,
-        label_w: int,
-        y: int,
-        usable_w: int,
-        height: int,
-        total: int,
-    ) -> None:
-        color = AOI_COLORS.get(aoi, QColor("#94A3B8"))
-        painter.setBrush(color)
-        painter.setPen(Qt.NoPen)
-        idx = 0
-        while idx < total:
-            if self.labels[idx] != aoi:
-                idx += 1
+        # Thin vertical separator between labels and data
+        painter.setPen(QColor(255, 255, 255, 18))
+        painter.drawLine(lx - 1, 0, lx - 1, h)
+
+        if not self._labels:
+            painter.setFont(QFont(Theme.FONT_UI, 7))
+            painter.setPen(QColor(Theme.TEXT_VFAINT))
+            painter.drawText(lx + 4, y0_aoi + 13, "Run Analysis to see AOI timeline")
+
+        # Row 1: AOI colour bars — run-length encoded to draw one rect per
+        # contiguous segment instead of one per frame (Bug 6 fix).
+        if self._labels:
+            n_labels = len(self._labels)
+            i = 0
+            while i < n_labels:
+                lbl = self._labels[i]
+                color = AOI_COLORS_QT.get(lbl)
+                if color is None:
+                    i += 1
+                    continue
+                # Find the end of this contiguous run
+                j = i + 1
+                while j < n_labels and self._labels[j] == lbl:
+                    j += 1
+                x1 = fx(i)
+                x2 = max(x1 + 1, fx(j))
+                painter.fillRect(x1, y0_aoi, x2 - x1, row_aoi, color)
+                i = j
+
+        # Row 2: Gaze presence strip — batch-computed with numpy instead of
+        # a per-point Python loop (Bug 5 fix).  Pre-computes all pixel
+        # coordinates, then draws only the visible range.
+        painter.fillRect(lx, y0_gaze, tw, row_gaze, QColor("#0d0e10"))
+        if len(self._gaze_x):
+            scene_h = 1200.0
+            gaze_color = QColor(Theme.ACCENT)
+            # Only process the visible frame range (zoom-aware)
+            lo = max(0, vs)
+            hi = min(len(self._gaze_x), ve + 1)
+            if hi > lo:
+                gx_slice = self._gaze_x[lo:hi]
+                gy_slice = self._gaze_y[lo:hi]
+                valid = np.isfinite(gx_slice) & np.isfinite(gy_slice)
+                if np.any(valid):
+                    indices = np.where(valid)[0]
+                    frame_indices = indices + lo
+                    # Vectorised pixel-coordinate computation
+                    x_coords = lx + ((frame_indices - vs) * tw / view_w).astype(int)
+                    norm_y = np.clip(gy_slice[indices] / scene_h, 0.0, 1.0)
+                    y_coords = (y0_gaze + norm_y * row_gaze).astype(int)
+                    for xi, yi in zip(x_coords, y_coords):
+                        painter.fillRect(int(xi), int(yi), 1, 1, gaze_color)
+
+        # Row 3: Fixation markers
+        painter.fillRect(lx, y0_fix, tw, row_fix, QColor("#0d0e10"))
+        fix_color = QColor("#d68a55")
+        for fi in self._fix_frames:
+            x = fx(fi)
+            painter.fillRect(x, y0_fix, 2, row_fix, fix_color)
+
+        # Row 4: Task spans
+        painter.fillRect(lx, y0_task, tw, row_task, QColor(Theme.BG_BASE))
+        accent = QColor(Theme.ACCENT)
+        for i, (name, tdata) in enumerate(self._tasks.items()):
+            s, e = tdata.get("start"), tdata.get("end")
+            if s is None or e is None or e <= s:
                 continue
-            start = idx
-            while idx < total and self.labels[idx] == aoi:
-                idx += 1
-            end = idx
-            x1 = label_w + int((start / total) * usable_w)
-            x2 = label_w + max(1, int((end / total) * usable_w))
-            painter.drawRoundedRect(QRect(x1, y, x2 - x1, height), 4, 4)
+            color = QColor(accent.red(), accent.green(), accent.blue(), 90 if i % 2 == 0 else 60)
+            x1 = fx(s)
+            x2 = max(x1 + 2, fx(e))
+            painter.fillRect(x1, y0_task, x2 - x1, row_task, color)
+            painter.setPen(QColor(Theme.TEXT_SECONDARY))
+            painter.setFont(QFont(Theme.FONT_MONO, 7))
+            painter.drawText(QRect(x1 + 2, y0_task, x2 - x1 - 2, row_task),
+                             Qt.AlignVCenter | Qt.AlignLeft, name.replace("Task ", "T"))
+
+        # Row dividers
+        painter.setPen(QColor(255, 255, 255, 18))
+        for y in (y0_gaze - 1, y0_fix - 1, y0_task - 1):
+            painter.drawLine(lx, y, w, y)
+
+        painter.end()
+        return px
 
     def mousePressEvent(self, event) -> None:
-        if not self.labels or event.button() != Qt.LeftButton:
-            return
-        frame = self._frame_from_x(event.position().toPoint().x())
-        if frame is None:
-            return
-        self.is_scrubbing = True
-        self.frameSelected.emit(frame)
+        self._drag_start_x    = event.position().x()
+        self._drag_start_view = self._visible_range()
+        self._drag_active     = False
 
     def mouseMoveEvent(self, event) -> None:
-        if not self.is_scrubbing:
+        if not (event.buttons() & Qt.LeftButton):
             return
-        frame = self._frame_from_x(event.position().toPoint().x())
-        if frame is not None:
-            self.frameSelected.emit(frame)
+        dx = event.position().x() - self._drag_start_x
+        if not self._drag_active and abs(dx) > 4:
+            self._drag_active = True
+        if not self._drag_active:
+            return
+        lx = self._LEFT_MARGIN
+        tw = max(1, self.width() - lx)
+        vs0, ve0 = self._drag_start_view
+        view_w = ve0 - vs0
+        new_start = max(0, min(self._n_frames - view_w, vs0 - dx / tw * view_w))
+        self._view_start = int(round(new_start))
+        self._view_end   = int(round(new_start + view_w))
+        self._cache_dirty = True
+        self.update()
 
     def mouseReleaseEvent(self, event) -> None:
-        if event.button() == Qt.LeftButton:
-            self.is_scrubbing = False
+        if not self._drag_active:
+            lx     = self._LEFT_MARGIN
+            tw     = max(1, self.width() - lx)
+            vs, ve = self._visible_range()
+            view_w = max(1, ve - vs)
+            click_x = max(0.0, event.position().x() - lx)
+            idx     = int(vs + click_x / tw * view_w)
+            self.frameClicked.emit(max(0, min(idx, self._n_frames - 1)))
+        self._drag_active = False
 
-    def _aoi_from_y(self, y: int) -> str | None:
-        row = int((y - 14) // 25)
-        if 0 <= row < len(self.aoi_names):
-            return self.aoi_names[row]
-        return None
 
-    def _frame_from_x(self, x: int) -> int | None:
-        if not self.labels:
+# ─── Left panel widgets ───────────────────────────────────────────────────────
+
+class TrimPanel(QWidget):
+    """Optional [in, out] frame range to exclude dead time (setup/calibration) from analysis."""
+    trimChanged = Signal(object, object)  # (start_frame | None, end_frame | None)
+    cropDataRequested = Signal()
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._start: Optional[int] = None
+        self._end: Optional[int] = None
+        self._current_frame = 0
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(6)
+        self._in_btn = QPushButton("Set In")
+        self._out_btn = QPushButton("Set Out")
+        self._clear_btn = QPushButton("Clear")
+        self._clear_btn.setObjectName("iconButton")
+        self._in_btn.setToolTip("Mark trim start at the current frame")
+        self._out_btn.setToolTip("Mark trim end at the current frame")
+        self._clear_btn.setToolTip("Remove trim — analyse the full recording")
+        btn_row.addWidget(self._in_btn)
+        btn_row.addWidget(self._out_btn)
+        btn_row.addWidget(self._clear_btn)
+        layout.addLayout(btn_row)
+
+        self._range_lbl = QLabel("Full recording (no trim)")
+        self._range_lbl.setWordWrap(True)
+        self._range_lbl.setStyleSheet(f"color: {Theme.TEXT_FAINT}; font-size: 12px;")
+        layout.addWidget(self._range_lbl)
+        
+        self._crop_btn = QPushButton("✂ Crop CSV Data Now")
+        self._crop_btn.setToolTip("Instantly remove all data outside the trimmed range from analysis.csv without re-running the slow analysis")
+        self._crop_btn.setObjectName("secondaryButton")
+        layout.addWidget(self._crop_btn)
+
+        pad_row = QHBoxLayout()
+        pad_row.setSpacing(6)
+        pad_lbl = QLabel("Padding (s):")
+        pad_lbl.setStyleSheet(f"font-size: 13px; color: {Theme.TEXT_MUTED};")
+        self._pad_spin = QDoubleSpinBox()
+        self._pad_spin.setRange(0.0, 5.0)
+        self._pad_spin.setSingleStep(0.1)
+        self._pad_spin.setValue(0.5)
+        self._pad_spin.setToolTip("Extra seconds kept on each side of the trimmed range, so a fixation right at the cut isn't sliced off")
+        pad_row.addWidget(pad_lbl)
+        pad_row.addWidget(self._pad_spin, 1)
+        layout.addLayout(pad_row)
+
+        self._in_btn.clicked.connect(self._set_in)
+        self._out_btn.clicked.connect(self._set_out)
+        self._clear_btn.clicked.connect(self._clear)
+        self._pad_spin.valueChanged.connect(lambda _: self._emit_changed())
+
+    def set_current_frame(self, idx: int) -> None:
+        self._current_frame = idx
+
+    def _set_in(self) -> None:
+        self._start = self._current_frame
+        if self._end is not None and self._end < self._start:
+            self._end = None
+        self._refresh()
+
+    def _set_out(self) -> None:
+        self._end = self._current_frame
+        if self._start is not None and self._start > self._end:
+            self._start = None
+        self._refresh()
+
+    def _clear(self) -> None:
+        self._start = None
+        self._end = None
+        self._refresh()
+
+    def _refresh(self) -> None:
+        if self._start is None and self._end is None:
+            self._range_lbl.setText("Full recording (no trim)")
+            self._range_lbl.setStyleSheet(f"color: {Theme.TEXT_FAINT}; font-size: 12px;")
+        elif self._start is not None and self._end is not None:
+            self._range_lbl.setText(
+                f"✓ Active — frame {self._start} → {self._end}  "
+                f"(+{self._pad_spin.value():.1f}s padding)\nWill apply on next Analyse"
+            )
+            self._range_lbl.setStyleSheet(f"color: {Theme.SUCCESS}; font-size: 12px; font-weight: 600;")
+        else:
+            s = self._start if self._start is not None else "start"
+            e = self._end if self._end is not None else "end"
+            self._range_lbl.setText(f"Trim: frame {s} → {e} — set the other bound to activate")
+            self._range_lbl.setStyleSheet(f"color: {Theme.TEXT_FAINT}; font-size: 12px;")
+        self._emit_changed()
+
+    def _emit_changed(self) -> None:
+        self.trimChanged.emit(self._start, self._end)
+
+    def get_trim(self) -> dict:
+        return {"start_frame": self._start, "end_frame": self._end, "padding_s": self._pad_spin.value()}
+
+    def load_trim(self, data: dict) -> None:
+        self._start = data.get("start_frame")
+        self._end = data.get("end_frame")
+        if "padding_s" in data:
+            self._pad_spin.setValue(float(data["padding_s"]))
+        self._refresh()
+
+    def reset(self) -> None:
+        self._start = None
+        self._end = None
+        self._pad_spin.setValue(0.5)
+        self._refresh()
+
+
+class CorrectionPanel(QWidget):
+    """Manual AOI relabelling for frames or a marked range."""
+    correctionApplied = Signal(bool)  # True = apply marked range, False = current frame only
+    correctionSaved = Signal()
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._start: Optional[int] = None
+        self._end: Optional[int] = None
+        self._current_frame = 0
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+
+        self._aoi_combo = QComboBox()
+        for name in EDITABLE_AOIS:
+            self._aoi_combo.addItem(name.replace("_", " "), userData=name)
+        layout.addWidget(self._aoi_combo)
+
+        btn_row1 = QHBoxLayout()
+        btn_row1.setSpacing(6)
+        btn_row2 = QHBoxLayout()
+        btn_row2.setSpacing(6)
+        
+        self._frame_btn = QPushButton("Set Frame")
+        self._in_btn = QPushButton("Range In")
+        self._out_btn = QPushButton("Range Out")
+        self._apply_btn = QPushButton("Apply Range")
+        self._apply_btn.setObjectName("primaryButton")
+        self._save_btn = QPushButton("Save CSV")
+        
+        self._frame_btn.setToolTip("Apply the selected AOI to the current frame")
+        self._in_btn.setToolTip("Mark range start at the current frame")
+        self._out_btn.setToolTip("Mark range end at the current frame")
+        self._apply_btn.setToolTip("Apply the selected AOI to every frame in the marked range")
+        self._save_btn.setToolTip("Save corrections back to analysis.csv (Updates dashboard)")
+        
+        btn_row1.addWidget(self._frame_btn)
+        btn_row1.addWidget(self._in_btn)
+        btn_row1.addWidget(self._out_btn)
+        
+        btn_row2.addWidget(self._apply_btn)
+        btn_row2.addWidget(self._save_btn)
+        
+        layout.addLayout(btn_row1)
+        layout.addLayout(btn_row2)
+
+        self._range_lbl = QLabel("No correction range")
+        self._range_lbl.setWordWrap(True)
+        self._range_lbl.setStyleSheet(f"color: {Theme.TEXT_FAINT}; font-size: 12px;")
+        layout.addWidget(self._range_lbl)
+
+        self._frame_btn.clicked.connect(self._apply_frame)
+        self._in_btn.clicked.connect(self._set_in)
+        self._out_btn.clicked.connect(self._set_out)
+        self._apply_btn.clicked.connect(self._apply_range)
+        self._save_btn.clicked.connect(self.correctionSaved.emit)
+
+    def set_current_frame(self, idx: int) -> None:
+        self._current_frame = idx
+
+    def reset(self) -> None:
+        self._start = None
+        self._end = None
+        self._refresh()
+
+    def selected_aoi(self) -> str:
+        data = self._aoi_combo.currentData()
+        return str(data) if data else NONE_LABEL
+
+    def _apply_frame(self) -> None:
+        self.correctionApplied.emit(False)
+
+    def _set_in(self) -> None:
+        self._start = self._current_frame
+        if self._end is not None and self._end < self._start:
+            self._end = None
+        self._refresh()
+
+    def _set_out(self) -> None:
+        self._end = self._current_frame
+        if self._start is not None and self._end < self._start:
+            self._start, self._end = self._end, self._start
+        self._refresh()
+
+    def _apply_range(self) -> None:
+        if self._start is None or self._end is None:
+            return
+        self.correctionApplied.emit(True)
+
+    def _refresh(self) -> None:
+        if self._start is None and self._end is None:
+            self._range_lbl.setText("No correction range")
+        elif self._start is not None and self._end is not None:
+            self._range_lbl.setText(f"Range: {self._start} → {self._end}")
+        elif self._start is not None:
+            self._range_lbl.setText(f"Range in: {self._start}  (set Range Out)")
+        else:
+            self._range_lbl.setText(f"Range out: {self._end}  (set Range In)")
+
+    def active_range(self) -> tuple[Optional[int], Optional[int]]:
+        return self._start, self._end
+
+
+# The design uses one accent dot for every task row — no per-task hue.
+_TASK_COLORS = [Theme.ACCENT] * 10
+
+
+class TaskPanel(QWidget):
+    """
+    10 tasks (T1–T10). Click a row to select it, then use S/E buttons
+    (or keyboard I/O) to mark start/end at the current video frame.
+    """
+    tasksChanged = Signal(dict)
+    N_TASKS = 10
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._current_frame: int = 0
+        self._fps: float = 30.0
+        self._selected: Optional[str] = None  # no task selected until user clicks a row
+        self._tasks: dict[str, dict] = {
+            f"Task {i}": {"start": None, "end": None} for i in range(1, self.N_TASKS + 1)
+        }
+        self._rows: dict[str, dict] = {}
+
+        # ── Frozen header (lives OUTSIDE the scroll area — set up in _build_ui) ──
+        self.header_widget = QWidget()
+        self.header_widget.setObjectName("taskHeader")
+        header_l = QHBoxLayout(self.header_widget)
+        header_l.setContentsMargins(6, 4, 6, 4)
+        header_l.setSpacing(4)
+
+        self._active_dot = QLabel("")
+        self._active_dot.setFixedWidth(12)
+
+        self._active_lbl = QLabel("select a task")
+        self._active_lbl.setStyleSheet(f"color: {Theme.TEXT_FAINT}; font-style: italic; font-size: 12px;")
+        self._active_lbl.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self._active_lbl.setMinimumWidth(0)
+
+        self._start_btn = QPushButton("Start")
+        self._start_btn.setFixedSize(48, 24)
+        self._start_btn.setObjectName("taskHeaderBtn")
+        self._start_btn.setEnabled(False)
+        self._start_btn.setToolTip("Set start of selected task at current frame  (shortcut: I)")
+
+        self._end_btn = QPushButton("End")
+        self._end_btn.setFixedSize(40, 24)
+        self._end_btn.setObjectName("taskHeaderBtn")
+        self._end_btn.setEnabled(False)
+        self._end_btn.setToolTip("Set end of selected task at current frame  (shortcut: O)")
+
+        header_l.addWidget(self._active_dot)
+        header_l.addWidget(self._active_lbl, 1)
+        header_l.addWidget(self._start_btn)
+        header_l.addWidget(self._end_btn)
+
+        # ── Scrollable rows only ──────────────────────────────────────────────
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        # Task rows
+        for i, name in enumerate(self._tasks):
+            color = _TASK_COLORS[i % len(_TASK_COLORS)]
+            row_w = QWidget()
+            row_w.setObjectName("taskRow")
+            row_w.setCursor(Qt.PointingHandCursor)
+            row_l = QHBoxLayout(row_w)
+            # Extra right margin clears the task_scroll vertical scrollbar so the
+            # trash button doesn't end up partially hidden underneath it.
+            row_l.setContentsMargins(6, 4, 20, 4)
+            row_l.setSpacing(6)
+
+            dot = QLabel("●")
+            dot.setFixedWidth(14)
+            dot.setStyleSheet(f"color: {color}; font-size: 14px;")
+
+            name_lbl = QLabel(name)
+            name_lbl.setFixedWidth(48)
+            name_lbl.setStyleSheet(f"color: {Theme.TEXT_SECONDARY}; font-size: 12px; font-weight: 500;")
+
+            range_lbl = QLabel("─ not set ─")
+            range_lbl.setStyleSheet(f"color: {Theme.TEXT_VFAINT}; font-size: 11px; font-family: '{Theme.FONT_MONO}', monospace;")
+
+            dur_lbl = QLabel("")
+            dur_lbl.setStyleSheet(f"color: {Theme.TEXT_MUTED}; font-size: 11px; font-family: '{Theme.FONT_MONO}', monospace;")
+            dur_lbl.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+
+            clr_btn = QPushButton()
+            clr_btn.setIcon(_svg_icon("trash.svg"))
+            clr_btn.setIconSize(QSize(13, 13))
+            clr_btn.setFixedSize(22, 22)
+            clr_btn.setObjectName("iconButton")
+            clr_btn.setToolTip(f"Clear {name}")
+            clr_btn.clicked.connect(lambda _, n=name: self._clear(n))
+
+            row_l.addWidget(dot)
+            row_l.addWidget(name_lbl)
+            row_l.addWidget(range_lbl, 1)
+            row_l.addWidget(dur_lbl)
+            row_l.addWidget(clr_btn)
+            outer.addWidget(row_w)
+
+            self._rows[name] = {
+                "widget": row_w, "color": color,
+                "range_lbl": range_lbl, "dur_lbl": dur_lbl,
+            }
+            self._tasks[name]["_row_color"] = color
+
+            # Click row to select
+            row_w.mousePressEvent = lambda ev, n=name: self._select(n)
+
+        self._start_btn.clicked.connect(self._on_start)
+        self._end_btn.clicked.connect(self._on_end)
+        # No task pre-selected — user must click a row first
+
+    # ── Public API ──────────────────────────────────────────────────────────
+
+    def set_current_frame(self, idx: int) -> None:
+        self._current_frame = idx
+
+    def set_fps(self, fps: float) -> None:
+        self._fps = max(1.0, float(fps))
+
+    def reset(self) -> None:
+        for name in self._tasks:
+            self._tasks[name]["start"] = None
+            self._tasks[name]["end"]   = None
+            self._refresh_row(name)
+        # Do NOT emit tasksChanged here — caller controls the save
+
+    def get_tasks(self) -> dict[str, dict]:
+        return {k: {"start": v["start"], "end": v["end"]}
+                for k, v in self._tasks.items()}
+
+    def load_tasks(self, tasks: dict) -> None:
+        for name, data in tasks.items():
+            if name in self._tasks:
+                self._tasks[name]["start"] = data.get("start")
+                self._tasks[name]["end"]   = data.get("end")
+                self._refresh_row(name)
+        self.tasksChanged.emit(self.get_tasks())
+
+    # ── Internal ────────────────────────────────────────────────────────────
+
+    def _select(self, name: str) -> None:
+        self._selected = name
+        self._active_dot.setStyleSheet(f"color: {Theme.ACCENT}; font-size: 11px;")
+        self._active_dot.setText("●")
+        self._active_lbl.setText(name)
+        self._active_lbl.setStyleSheet(f"color: {Theme.TEXT_BRIGHT}; font-weight: 600; font-size: 12px; font-style: normal;")
+        self._start_btn.setEnabled(True)
+        self._end_btn.setEnabled(True)
+        for n, row in self._rows.items():
+            row["widget"].setStyleSheet(
+                f"QWidget#taskRow {{ background: {'rgba(255,255,255,.05)' if n == name else 'transparent'}; "
+                f"border-radius: {Theme.RADIUS}px; }}"
+            )
+
+    def _on_start(self) -> None:
+        if self._selected is None:
+            return
+        self._tasks[self._selected]["start"] = self._current_frame
+        self._refresh_row(self._selected)
+        self.tasksChanged.emit(self.get_tasks())
+
+    def _on_end(self) -> None:
+        if self._selected is None:
+            return
+        self._tasks[self._selected]["end"] = self._current_frame
+        self._refresh_row(self._selected)
+        self.tasksChanged.emit(self.get_tasks())
+
+    def _clear(self, name: str) -> None:
+        self._tasks[name]["start"] = None
+        self._tasks[name]["end"]   = None
+        self._refresh_row(name)
+        self.tasksChanged.emit(self.get_tasks())
+
+    def _refresh_row(self, name: str) -> None:
+        row  = self._rows[name]
+        s, e = self._tasks[name]["start"], self._tasks[name]["end"]
+        mono = f"font-family: '{Theme.FONT_MONO}', monospace;"
+        if s is not None and e is not None:
+            dur_s = abs(e - s) / self._fps
+            row["range_lbl"].setText(f"{s} → {e}")
+            row["range_lbl"].setStyleSheet(f"color: {Theme.TEXT_SECONDARY}; font-size: 11px; font-weight: 500; {mono}")
+            row["dur_lbl"].setText(f"{int(dur_s//60)}:{int(dur_s%60):02d}")
+        elif s is not None:
+            row["range_lbl"].setText(f"{s} → ?")
+            row["range_lbl"].setStyleSheet(f"color: {Theme.TEXT_DIM}; font-size: 11px; {mono}")
+            row["dur_lbl"].setText("")
+        else:
+            row["range_lbl"].setText("─ not set ─")
+            row["range_lbl"].setStyleSheet(f"color: {Theme.TEXT_VFAINT}; font-size: 11px; {mono}")
+            row["dur_lbl"].setText("")
+
+
+# ─── Dashboard tab ────────────────────────────────────────────────────────────
+
+class DashboardWidget(QWidget):
+    """
+    Dashboard with:
+      • Recording picker: individual recording or all (aggregate)
+      • Chart 1: AOI dwell % bar chart  (mean ± std when multiple recordings)
+      • Chart 2: Learning curve — task duration vs task number
+      • Chart 3: Per-recording heatmap
+      • Stats table in HTML
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(12)
+
+        # ── Left sidebar: all controls, stacked vertically ──────────────────────
+        sidebar = QFrame()
+        sidebar.setObjectName("leftPanel")
+        sidebar.setFixedWidth(224)
+        side_l = QVBoxLayout(sidebar)
+        side_l.setContentsMargins(16, 18, 16, 18)
+        side_l.setSpacing(10)
+
+        self._diff_combo = QComboBox()
+        self._diff_combo.setToolTip("Difficulty folder (Easy / Medium / Hard)")
+
+        self._rec_combo = QComboBox()
+        self._rec_combo.setToolTip("Individual recording or All (aggregate mean)")
+
+        self._task_combo = QComboBox()
+        self._task_combo.addItems(["All Tasks"] + [f"Task {i}" for i in range(1, 11)])
+
+        self._load_btn     = QPushButton("  Load  ")
+        self._gen_btn      = QPushButton("  Rebuild  ")
+        self._png_btn      = QPushButton("📷  Save PNGs")
+        self._export_btn   = QPushButton("📗  Export Workbook")
+
+        self._load_btn.setObjectName("primaryButton")
+        self._load_btn.setToolTip("Load saved analysis for the selected recording")
+        self._gen_btn.setToolTip("Force-rebuild all charts (same as Load but always regenerates)")
+
+        side_l.addWidget(QLabel("Difficulty:"))
+        side_l.addWidget(self._diff_combo)
+        side_l.addWidget(QLabel("Recording:"))
+        side_l.addWidget(self._rec_combo)
+        side_l.addWidget(QLabel("Task:"))
+        side_l.addWidget(self._task_combo)
+
+        _div1 = QFrame(); _div1.setFrameShape(QFrame.HLine); _div1.setObjectName("divider")
+        side_l.addWidget(_div1)
+
+        side_l.addWidget(self._load_btn)
+        side_l.addWidget(self._gen_btn)
+        side_l.addWidget(self._png_btn)
+        side_l.addWidget(self._export_btn)
+        side_l.addStretch(1)
+
+        self._status = QLabel("")
+        self._status.setWordWrap(True)
+        self._status.setStyleSheet(f"color: {Theme.TEXT_MUTED}; font-size: 12px;")
+        side_l.addWidget(self._status)
+
+        layout.addWidget(sidebar)
+
+        # ── Right: chart area fills all remaining space ─────────────────────────
+        chart_area = QVBoxLayout()
+        chart_area.setContentsMargins(0, 0, 0, 0)
+
+        # ── Stacked: aggregate view (page 0) vs per-recording view (page 1) ──
+        self._stack = QStackedWidget()
+
+        # Page 0 — aggregate / multi-recording 6-tab view (mirrors individual)
+        agg_container = QWidget()
+        agg_vl = QVBoxLayout(agg_container)
+        agg_vl.setContentsMargins(0, 0, 0, 0)
+        self._agg_tabs = QTabWidget()
+        self._agg_tab_views: dict[str, QWebEngineView] = {}
+        for slug, label in _REC_TAB_DEFS:
+            view = QWebEngineView()
+            view.setHtml(_CHART_PLACEHOLDER)
+            self._agg_tabs.addTab(view, f"  {label}  ")
+            self._agg_tab_views[slug] = view
+        agg_vl.addWidget(self._agg_tabs)
+        self._stack.addWidget(agg_container)
+
+        # Page 1 — individual recording: 6 sub-tabs
+        rec_container = QWidget()
+        rec_vl = QVBoxLayout(rec_container)
+        rec_vl.setContentsMargins(0, 0, 0, 0)
+        self._rec_tabs = QTabWidget()
+        self._rec_tab_views: dict[str, QWebEngineView] = {}
+        for slug, label in _REC_TAB_DEFS:
+            view = QWebEngineView()
+            view.setHtml(_CHART_PLACEHOLDER)
+            self._rec_tabs.addTab(view, f"  {label}  ")
+            self._rec_tab_views[slug] = view
+        rec_vl.addWidget(self._rec_tabs)
+        self._stack.addWidget(rec_container)
+
+        chart_area.addWidget(self._stack, 1)
+        layout.addLayout(chart_area, 1)
+
+        self._diff_combo.currentIndexChanged.connect(self._refresh_rec_combo)
+        self._load_btn.clicked.connect(self._generate)
+        self._gen_btn.clicked.connect(self._generate)
+        self._png_btn.clicked.connect(self._export_png)
+        self._export_btn.clicked.connect(self._export_workbook)
+        self._populate_diff_combo()
+
+    # ── Populate dropdowns ────────────────────────────────────────────────────
+
+    def _populate_diff_combo(self) -> None:
+        self._diff_combo.blockSignals(True)
+        self._diff_combo.clear()
+        if RECORDINGS_DIR.exists():
+            for d in sorted(RECORDINGS_DIR.iterdir()):
+                if d.is_dir():
+                    self._diff_combo.addItem(d.name, userData=d)
+        self._diff_combo.blockSignals(False)
+        self._refresh_rec_combo()
+
+    def _refresh_rec_combo(self) -> None:
+        self._rec_combo.clear()
+        src: Optional[pathlib.Path] = self._diff_combo.currentData()
+        if src is None or not src.exists():
+            return
+        self._rec_combo.addItem("All recordings (aggregate)", userData=None)
+        for d in sorted(src.iterdir()):
+            if d.is_dir() and (d / "info.json").exists():
+                self._rec_combo.addItem(d.name, userData=d)
+
+    def _current_source(self) -> Optional[pathlib.Path]:
+        return self._diff_combo.currentData()
+
+    # ── Collect CSVs ─────────────────────────────────────────────────────────
+
+    def _collect_csvs(self) -> tuple[Optional[pathlib.Path], Optional[pathlib.Path], list[tuple[str, pathlib.Path]]]:
+        """Returns (src_dir, rec_filter, csvs_list)."""
+        src: Optional[pathlib.Path] = self._current_source()
+        if src is None:
+            return None, None, []
+        rec_filter: Optional[pathlib.Path] = self._rec_combo.currentData()
+        csvs: list[tuple[str, pathlib.Path]] = []
+        for rec_dir in sorted(src.iterdir()):
+            if not rec_dir.is_dir():
+                continue
+            if rec_filter is not None and rec_dir != rec_filter:
+                continue
+            for cand in [
+                rec_dir / "aoi_results" / "analysis.csv",
+                rec_dir / "aoi_results" / "raw" / "analysis.csv",
+            ]:
+                if cand.exists() and cand.stat().st_size > 0:
+                    csvs.append((rec_dir.name, cand))
+                    break
+        return src, rec_filter, csvs
+
+    # ── Generate ──────────────────────────────────────────────────────────────
+
+    def _generate(self) -> None:
+        src, rec_filter, csvs = self._collect_csvs()
+        if src is None:
+            return
+        if not csvs:
+            self._status.setText("No analysed recordings found. Run Analysis first.")
+            return
+        self._status.setText("Building charts…")
+        QApplication.processEvents()
+        task_filter = self._task_combo.currentText()
+
+        if rec_filter is not None:
+            # ── Single recording → individual 6-tab view ──────────────────────
+            self._stack.setCurrentIndex(1)
+            self._generate_single(rec_filter, csvs[0][1], task_filter)
+            self._status.setText(f"{rec_filter.name}")
+        else:
+            # ── All recordings → aggregate 6-tab view ─────────────────────────
+            self._stack.setCurrentIndex(0)
+            self._generate_aggregate(csvs, task_filter)
+            self._status.setText(f"{len(csvs)} recording(s) from {src.name}.")
+
+    # ── Individual recording view ─────────────────────────────────────────────
+
+    @staticmethod
+    def _fig_to_html(fig) -> str:
+        chart_html = fig.to_html(
+            full_html=False, include_plotlyjs="cdn",
+            config={"responsive": True}, default_height="100%",
+        )
+        return (
+            "<!DOCTYPE html><html><head><meta charset='utf-8'>"
+            "<style>html,body{height:100%;background:#0e0f11;margin:0;padding:8px;"
+            "box-sizing:border-box}.plotly-graph-div{height:100% !important;"
+            "width:100% !important}</style></head>"
+            f"<body>{chart_html}</body></html>"
+        )
+
+    @staticmethod
+    def _no_data_html(msg: str) -> str:
+        return (
+            "<!DOCTYPE html><html><head><meta charset='utf-8'>"
+            "<style>body{background:#0e0f11;color:#62656b;display:flex;align-items:center;"
+            "justify-content:center;height:90vh;font-family:'Hanken Grotesk',sans-serif;"
+            "font-size:14px;text-align:center;padding:20px}</style>"
+            f"</head><body>{msg}</body></html>"
+        )
+
+    def _generate_single(self, rec_dir: pathlib.Path, csv_path: pathlib.Path,
+                         task_filter: str) -> None:
+        try:
+            df = pd.read_csv(csv_path)
+        except Exception as exc:
+            for v in self._rec_tab_views.values():
+                v.setHtml(self._no_data_html(f"Could not read analysis.csv:<br>{exc}"))
+            return
+
+        lbl_col = "final_primary_aoi" if "final_primary_aoi" in df.columns else "primary_aoi"
+        df["_aoi"] = df[lbl_col].fillna(NONE_LABEL).astype(str)
+        total = len(df)
+
+        # Estimate fps from time_s column
+        fps = 30.0
+        if "time_s" in df.columns and total > 1:
+            times = pd.to_numeric(df["time_s"], errors="coerce").dropna()
+            dur = float(times.iloc[-1] - times.iloc[0]) if len(times) > 1 else 0.0
+            if dur > 0:
+                fps = max(1.0, (len(times) - 1) / dur)
+
+        self._pop_dq_tab(rec_dir, df, total, fps)
+        self._pop_dwell_tab(df, total, fps)
+        self._pop_fixation_tab(rec_dir)
+        self._pop_heatmap_tab(df)
+        self._pop_transition_tab(df)
+        self._pop_learning_tab(rec_dir, fps, task_filter)
+
+    # ── Tab 1: Data Quality ───────────────────────────────────────────────────
+
+    def _pop_dq_tab(self, rec_dir: pathlib.Path, df: pd.DataFrame,
+                    total: int, fps: float) -> None:
+        view = self._rec_tab_views["dq"]
+
+        dq, pr = {}, {}
+        for fname, target in [("data_quality.json", "dq"),
+                               ("preprocessing_report.json", "pr")]:
+            for base in [rec_dir / "aoi_results" / "raw" / fname,
+                         rec_dir / "aoi_results" / fname]:
+                if base.exists():
+                    try:
+                        val = json.loads(base.read_text(encoding="utf-8"))
+                        if target == "dq":
+                            dq = val
+                        else:
+                            pr = val
+                    except Exception:
+                        pass
+                    break
+
+        valid_pct  = 100.0 - float(dq.get("missing_gaze_pct", 0.0))
+        fix_n      = int(dq.get("fixation_count", 0))
+        dur_s      = float(dq.get("recording_duration_s", total / fps))
+        fps_val    = float(dq.get("fps", fps))
+        dur_str    = f"{int(dur_s)//60}:{int(dur_s)%60:02d}"
+        no_aoi_pct = float((df["_aoi"] == NONE_LABEL).sum() / total * 100) if total > 0 else 0.0
+        cov_pct    = 100.0 - no_aoi_pct
+
+        def _col(v, good, warn):
+            return "#6fae7d" if v >= good else "#d4a24a" if v >= warn else "#cf6b6b"
+
+        # AOI dwell table rows
+        aoi_rows = ""
+        for aoi in AOI_NAMES:
+            cnt  = int((df["_aoi"] == aoi).sum())
+            if cnt == 0:
+                continue
+            pct  = cnt / total * 100
+            dwell_s = cnt / fps
+            color = AOI_COLORS_QT.get(aoi, QColor("#888")).name()
+            aoi_rows += (
+                f"<tr><td style='color:{color}'><b>{aoi}</b></td>"
+                f"<td>{cnt}</td><td>{pct:.1f}%</td><td>{dwell_s:.1f}s</td></tr>"
+            )
+
+        # Detection method breakdown (from preprocessing_report.json)
+        det_section = ""
+        if pr:
+            det_section = f"""
+<div class='section'><h3>Detection Method Breakdown</h3>
+<table><tr><th>Method</th><th>Frames</th><th>%</th></tr>
+<tr><td>3D Surface Mapper</td><td>{pr.get('surface_3d_frames','—')}</td>
+    <td>{pr.get('surface_3d_pct','—')}%</td></tr>
+<tr><td>2D Partial-marker Fallback</td><td>{pr.get('fallback_2d_frames','—')}</td>
+    <td>{pr.get('fallback_2d_pct','—')}%</td></tr>
+<tr><td>No Detection (NoAOI)</td><td>{pr.get('no_aoi_frames','—')}</td>
+    <td>{pr.get('no_aoi_pct','—')}%</td></tr>
+</table>
+<p style='color:#5a5d63;font-size:12px;margin-top:10px;line-height:1.7'>
+3D Surface Mapper = highest accuracy (all markers visible).<br>
+2D Fallback = partial marker visibility, still classified.<br>
+NoAOI = insufficient markers or gaze outside defined areas.
+</p></div>"""
+
+        html = f"""<!DOCTYPE html><html><head><meta charset='utf-8'>
+<style>
+body{{background:#0e0f11;color:#e7e8ea;font-family:'Hanken Grotesk',sans-serif;margin:0;padding:20px}}
+.grid{{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;margin-bottom:20px}}
+.card{{background:#131416;border:1px solid rgba(255,255,255,.06);border-radius:8px;padding:18px}}
+.val{{font-size:28px;font-weight:500;margin:8px 0 4px;font-family:'IBM Plex Mono',monospace}}
+.lbl{{font-size:12px;color:#83868c}}
+.section{{margin-top:24px}}
+.section h3{{color:#6a6d73;font-size:11px;letter-spacing:1.1px;text-transform:uppercase;font-weight:500;
+  border-bottom:1px solid rgba(255,255,255,.07);padding-bottom:8px;margin-bottom:10px}}
+table{{width:100%;border-collapse:collapse;font-size:13px}}
+td,th{{padding:9px 14px 9px 0}}
+th{{color:#62656b;font-size:11px;letter-spacing:.05em;border-bottom:1px solid rgba(255,255,255,.06)}}
+td{{border-bottom:1px solid rgba(255,255,255,.04)}}
+</style></head><body>
+<h2 style='margin:0 0 14px;font-size:15px;font-family:"IBM Plex Mono",monospace;font-weight:400'>{rec_dir.name}</h2>
+<div class='grid'>
+  <div class='card'><div class='lbl'>Valid Gaze</div>
+    <div class='val' style='color:{_col(valid_pct,80,60)}'>{valid_pct:.1f}%</div>
+    <div class='lbl'>{int(dq.get("valid_gaze_frames",0))} / {total} frames</div></div>
+  <div class='card'><div class='lbl'>Fixations Detected</div>
+    <div class='val' style='color:#6e8fd6'>{fix_n}</div>
+    <div class='lbl'>from Neon SDK</div></div>
+  <div class='card'><div class='lbl'>Duration</div>
+    <div class='val'>{dur_str}</div>
+    <div class='lbl'>{fps_val:.0f} fps · {total} frames</div></div>
+  <div class='card'><div class='lbl'>AOI Coverage</div>
+    <div class='val' style='color:{_col(cov_pct,80,60)}'>{cov_pct:.1f}%</div>
+    <div class='lbl'>frames within an AOI</div></div>
+  <div class='card'><div class='lbl'>NoAOI</div>
+    <div class='val' style='color:{"#cf6b6b" if no_aoi_pct>30 else "#666"}'>{no_aoi_pct:.1f}%</div>
+    <div class='lbl'>outside all AOI boundaries</div></div>
+  <div class='card'><div class='lbl'>Missing Gaze</div>
+    <div class='val' style='color:{"#cf6b6b" if (100-valid_pct)>20 else "#666"}'>{100-valid_pct:.1f}%</div>
+    <div class='lbl'>blinks / data loss</div></div>
+</div>
+<div class='section'><h3>AOI Frame Distribution</h3>
+<table><tr><th>AOI</th><th>Frames</th><th>%</th><th>Dwell (s)</th></tr>
+{aoi_rows}</table></div>
+{det_section}
+</body></html>"""
+        view.setHtml(html)
+
+    # ── Tab 2: Dwell Time ─────────────────────────────────────────────────────
+
+    def _pop_dwell_tab(self, df: pd.DataFrame, total: int, fps: float) -> None:
+        view = self._rec_tab_views["dwell"]
+        rows = []
+        for aoi in AOI_NAMES:
+            cnt = int((df["_aoi"] == aoi).sum())
+            rows.append({"aoi": aoi, "dwell_pct": cnt / total * 100 if total else 0.0,
+                         "dwell_s": cnt / fps})
+        ddf   = pd.DataFrame(rows)
+        colors = [AOI_COLORS_QT.get(a, QColor("#6e8fd6")).name() for a in ddf["aoi"]]
+        fig = go.Figure(go.Bar(
+            x=ddf["aoi"], y=ddf["dwell_pct"],
+            marker_color=colors,
+            customdata=ddf["dwell_s"].round(1).values,
+            hovertemplate="<b>%{x}</b><br>%{y:.1f}%<br>%{customdata}s<extra></extra>",
+        ))
+        fig.update_layout(title="Gaze Dwell Time per AOI",
+                          xaxis_title="AOI", yaxis_title="Dwell (%)",
+                          template="aoi_studio", autosize=True,
+                          margin=dict(t=50, b=40))
+        view.setHtml(self._fig_to_html(fig))
+
+    # ── Tab 3: Fixation Metrics ───────────────────────────────────────────────
+
+    def _pop_fixation_tab(self, rec_dir: pathlib.Path) -> None:
+        view = self._rec_tab_views["fixations"]
+        fix_path = None
+        for p in [rec_dir / "aoi_results" / "raw" / "fixation_summary.csv",
+                  rec_dir / "aoi_results" / "fixation_summary.csv"]:
+            if p.exists() and p.stat().st_size > 0:
+                fix_path = p
+                break
+        if fix_path is None:
+            view.setHtml(self._no_data_html(
+                "Re-run Analysis to generate fixation_summary.csv.<br>"
+                "Recordings analysed before Phase 7 need to be re-analysed."))
+            return
+        try:
+            fdf = pd.read_csv(fix_path)
+        except Exception as exc:
+            view.setHtml(self._no_data_html(str(exc)))
+            return
+
+        rows = []
+        for aoi in AOI_NAMES:
+            aoi_rows = fdf[fdf["dominant_aoi"] == aoi]
+            rows.append({"aoi": aoi,
+                         "count": len(aoi_rows),
+                         "mean_dur": float(aoi_rows["duration_s"].mean()) if len(aoi_rows) else 0.0,
+                         "total_dur": float(aoi_rows["duration_s"].sum()) if len(aoi_rows) else 0.0})
+        adf    = pd.DataFrame(rows)
+        colors = [AOI_COLORS_QT.get(a, QColor("#6e8fd6")).name() for a in adf["aoi"]]
+
+        fig = make_subplots(rows=1, cols=2,
+                            subplot_titles=("Fixation Count per AOI",
+                                            "Mean Fixation Duration (s)"))
+        fig.add_trace(go.Bar(x=adf["aoi"], y=adf["count"], marker_color=colors,
+                             hovertemplate="<b>%{x}</b><br>Count: %{y}<extra></extra>"),
+                      row=1, col=1)
+        fig.add_trace(go.Bar(x=adf["aoi"], y=adf["mean_dur"].round(3),
+                             marker_color=colors,
+                             hovertemplate="<b>%{x}</b><br>Mean: %{y:.3f}s<extra></extra>"),
+                      row=1, col=2)
+        fig.update_layout(template="aoi_studio", autosize=True,
+                          showlegend=False, margin=dict(t=50, b=40))
+        view.setHtml(self._fig_to_html(fig))
+
+    # ── Tab 4: AOI Heatmaps ───────────────────────────────────────────────────
+
+    def _pop_heatmap_tab(self, df: pd.DataFrame) -> None:
+        view = self._rec_tab_views["heatmaps"]
+        if "gaze_on_aoi_x" not in df.columns or "gaze_on_aoi_y" not in df.columns:
+            view.setHtml(self._no_data_html(
+                "No surface coordinate data in analysis.csv.<br>"
+                "Heatmaps require 3D surface detection during analysis."))
+            return
+
+        from scipy.ndimage import gaussian_filter as _gf
+
+        aois_data = []
+        for aoi in AOI_NAMES:
+            sub  = df[df["_aoi"] == aoi]
+            x    = pd.to_numeric(sub["gaze_on_aoi_x"], errors="coerce").dropna().values
+            y    = pd.to_numeric(sub["gaze_on_aoi_y"], errors="coerce").dropna().values
+            mask = (x >= 0) & (x <= 1) & (y >= 0) & (y <= 1)
+            if mask.sum() >= 10:
+                aois_data.append((aoi, x[mask], y[mask]))
+
+        if not aois_data:
+            view.setHtml(self._no_data_html(
+                "Not enough surface coordinate data for heatmaps.<br>"
+                "Re-run Analysis to regenerate with current pipeline."))
+            return
+
+        n    = len(aois_data)
+        cols = min(3, n)
+        rows = (n + cols - 1) // cols
+        fig  = make_subplots(rows=rows, cols=cols,
+                             subplot_titles=[a[0] for a in aois_data])
+
+        for i, (aoi_name, x, y) in enumerate(aois_data):
+            r, c = i // cols + 1, i % cols + 1
+            color = AOI_COLORS_QT.get(aoi_name, QColor("#6e8fd6"))
+            rv, gv, bv = color.red(), color.green(), color.blue()
+            H, xe, ye = np.histogram2d(x, y, bins=25, range=[[0, 1], [0, 1]])
+            Hs = _gf(H.T, sigma=1.5)
+            Hn = Hs / Hs.max() if Hs.max() > 0 else Hs
+            colorscale = [[0.0, "rgba(0,0,0,0)"],
+                          [0.3, f"rgba({rv},{gv},{bv},0.3)"],
+                          [1.0, f"rgba({rv},{gv},{bv},1.0)"]]
+            fig.add_trace(go.Heatmap(
+                z=Hn,
+                x=xe[:-1] + (xe[1] - xe[0]) / 2,
+                y=ye[:-1] + (ye[1] - ye[0]) / 2,
+                colorscale=colorscale, showscale=False,
+                hovertemplate=f"X:%{{x:.2f}} Y:%{{y:.2f}}<br>Density:%{{z:.2f}}<extra>{aoi_name}</extra>",
+            ), row=r, col=c)
+
+        fig.update_xaxes(range=[0, 1], showticklabels=False, showgrid=False)
+        fig.update_yaxes(range=[0, 1], showticklabels=False, showgrid=False)
+        fig.update_layout(
+            title="Spatial Gaze Distribution within Each AOI Surface (0–1 normalised)",
+            template="aoi_studio",
+            height=max(360, 340 * rows),
+            margin=dict(t=60, b=20))
+        view.setHtml(self._fig_to_html(fig))
+
+    # ── Tab 5: Transition Matrix ──────────────────────────────────────────────
+
+    def _pop_transition_tab(self, df: pd.DataFrame) -> None:
+        view = self._rec_tab_views["transitions"]
+        labels = df["_aoi"].values
+        matrix = pd.DataFrame(0, index=AOI_NAMES, columns=AOI_NAMES, dtype=int)
+        for i in range(len(labels) - 1):
+            src, dst = str(labels[i]), str(labels[i + 1])
+            if src != dst and src in matrix.index and dst in matrix.columns:
+                matrix.loc[src, dst] += 1
+        row_sums = matrix.sum(axis=1)
+        normed   = (matrix.div(row_sums.replace(0, np.nan), axis=0)
+                    .fillna(0) * 100).round(1)
+
+        if normed.values.sum() == 0:
+            view.setHtml(self._no_data_html("No AOI transitions detected in this recording."))
+            return
+
+        fig = go.Figure(go.Heatmap(
+            z=normed.values.tolist(),
+            x=list(normed.columns),
+            y=list(normed.index),
+            colorscale="Blues",
+            text=normed.values.round(1).tolist(),
+            texttemplate="%{text}",
+            textfont=dict(size=11),
+            hovertemplate="From: %{y}<br>To: %{x}<br>%{z:.1f}%<extra></extra>",
+        ))
+        fig.update_layout(
+            title="AOI Transition Probabilities — row→column (% of outgoing transitions)",
+            template="aoi_studio",
+            height=max(360, 50 * len(AOI_NAMES) + 160),
+            xaxis_title="To AOI", yaxis_title="From AOI",
+            margin=dict(t=60, b=60, l=110, r=40))
+        view.setHtml(self._fig_to_html(fig))
+
+    # ── Tab 6: Learning Curve ─────────────────────────────────────────────────
+
+    def _pop_learning_tab(self, rec_dir: pathlib.Path, fps: float,
+                          task_filter: str) -> None:
+        view = self._rec_tab_views["learning"]
+        task_path = None
+        for p in [rec_dir / "aoi_results" / "tasks.json",
+                  rec_dir / "aoi_results" / "raw" / "tasks.json"]:
+            if p.exists():
+                task_path = p
+                break
+        if task_path is None:
+            view.setHtml(self._no_data_html(
+                "No tasks annotated yet.<br>"
+                "Mark task repetitions T1–T10 in the Studio tab."))
+            return
+        try:
+            tasks = json.loads(task_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            view.setHtml(self._no_data_html(str(exc)))
+            return
+
+        analysis_df = None
+        for csv_p in [
+            rec_dir / "aoi_results" / "analysis.csv",
+            rec_dir / "aoi_results" / "raw" / "analysis.csv",
+        ]:
+            if csv_p.exists() and csv_p.stat().st_size > 0:
+                try:
+                    analysis_df = pd.read_csv(csv_p)
+                    break
+                except Exception:
+                    pass
+
+        rows = []
+        for t_name, t_data in tasks.items():
+            s, e = t_data.get("start"), t_data.get("end")
+            if s is None or e is None or e <= s:
+                continue
+            digits = "".join(c for c in t_name if c.isdigit())
+            if analysis_df is not None:
+                dur_s = reporting._duration_between_frame_range(
+                    analysis_df, int(s), int(e), fps
+                )
+            else:
+                dur_s = (int(e) - int(s)) / fps
+            rows.append({"task": t_name,
+                         "task_idx": int(digits) if digits else 0,
+                         "dur_s": dur_s})
+        if not rows:
+            view.setHtml(self._no_data_html("No complete task annotations found."))
+            return
+
+        tdf = pd.DataFrame(rows).sort_values("task_idx")
+        if task_filter != "All Tasks":
+            tdf = tdf[tdf["task"] == task_filter]
+        if tdf.empty:
+            view.setHtml(self._no_data_html(f"No data for filter: {task_filter}"))
+            return
+
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(
+            x=tdf["task_idx"], y=tdf["dur_s"],
+            mode="lines+markers",
+            line=dict(width=2, color="#6e8fd6"),
+            marker=dict(size=8, color="#6e8fd6"),
+            customdata=tdf["task"].values,
+            hovertemplate="<b>%{customdata}</b><br>Duration: %{y:.1f}s<extra></extra>",
+        ))
+        # Trend line
+        if len(tdf) > 2:
+            z = np.polyfit(tdf["task_idx"].values, tdf["dur_s"].values, 1)
+            xr = np.linspace(tdf["task_idx"].min(), tdf["task_idx"].max(), 50)
+            fig.add_trace(go.Scatter(
+                x=xr, y=np.poly1d(z)(xr),
+                mode="lines",
+                line=dict(width=1.5, dash="dash", color="#333"),
+                showlegend=False, hoverinfo="skip",
+            ))
+        mean_dur = tdf["dur_s"].mean()
+        fig.add_hline(y=mean_dur, line_dash="dot", line_color="#555",
+                      annotation_text=f"Mean {mean_dur:.1f}s",
+                      annotation_position="bottom right")
+        fig.update_layout(
+            title="Learning Curve — Task Duration per Repetition",
+            xaxis=dict(title="Repetition", dtick=1),
+            yaxis_title="Duration (s)",
+            template="aoi_studio", autosize=True,
+            showlegend=False, margin=dict(t=50, b=40))
+        view.setHtml(self._fig_to_html(fig))
+
+    # ── Aggregate (multi-recording) tab population ────────────────────────────
+
+    @staticmethod
+    def _rec_dir_from_csv(csv_path: pathlib.Path) -> pathlib.Path:
+        """Derive the recording folder from its analysis.csv path."""
+        return csv_path.parent.parent.parent if csv_path.parent.name == "raw" \
+               else csv_path.parent.parent
+
+    def _generate_aggregate(self, csvs: list[tuple[str, pathlib.Path]],
+                            task_filter: str) -> None:
+        self._pop_agg_dq_tab(csvs)
+        QApplication.processEvents()
+        self._pop_agg_dwell_tab(csvs)
+        QApplication.processEvents()
+        self._pop_agg_fixation_tab(csvs)
+        QApplication.processEvents()
+        self._pop_agg_heatmap_tab(csvs)
+        QApplication.processEvents()
+        self._pop_agg_transition_tab(csvs)
+        QApplication.processEvents()
+        self._pop_agg_learning_tab(csvs, task_filter)
+
+    # ── Aggregate Tab 1: Data Quality ─────────────────────────────────────────
+
+    def _pop_agg_dq_tab(self, csvs: list[tuple[str, pathlib.Path]]) -> None:
+        view = self._agg_tab_views["dq"]
+        n = len(csvs)
+        valid_pcts, fix_counts, dur_ss, cov_pcts = [], [], [], []
+        aoi_frames_all: dict[str, list[float]] = {a: [] for a in AOI_NAMES}
+
+        for _rec_name, csv_path in csvs:
+            rec_dir = self._rec_dir_from_csv(csv_path)
+            dq: dict = {}
+            for dq_path in [rec_dir / "aoi_results" / "raw" / "data_quality.json",
+                            rec_dir / "aoi_results" / "data_quality.json"]:
+                if dq_path.exists():
+                    try:
+                        dq = json.loads(dq_path.read_text(encoding="utf-8"))
+                    except Exception:
+                        pass
+                    break
+            valid_pcts.append(100.0 - float(dq.get("missing_gaze_pct", 0.0)))
+            fix_counts.append(float(dq.get("fixation_count", 0)))
+            dur_ss.append(float(dq.get("recording_duration_s", 0.0)))
+            try:
+                df = pd.read_csv(csv_path)
+                lbl_col = "final_primary_aoi" if "final_primary_aoi" in df.columns else "primary_aoi"
+                df["_aoi"] = df[lbl_col].fillna(NONE_LABEL).astype(str)
+                total = max(1, len(df))
+                cov_pcts.append(100.0 - (df["_aoi"] == NONE_LABEL).sum() / total * 100)
+                for aoi in AOI_NAMES:
+                    aoi_frames_all[aoi].append((df["_aoi"] == aoi).sum() / total * 100)
+            except Exception:
+                cov_pcts.append(0.0)
+
+        def _ms(vals: list) -> tuple[float, float]:
+            if not vals:
+                return 0.0, 0.0
+            arr = np.array(vals, dtype=float)
+            return float(arr.mean()), float(arr.std(ddof=1)) if len(arr) > 1 else 0.0
+
+        def _col(v: float, good: float, warn: float) -> str:
+            return "#6fae7d" if v >= good else "#d4a24a" if v >= warn else "#cf6b6b"
+
+        def _pm(std: float) -> str:
+            return f" <span style='color:#444'>±{std:.1f}</span>" if std > 0 else ""
+
+        mv, sv = _ms(valid_pcts)
+        mf, sf = _ms(fix_counts)
+        md, sd = _ms(dur_ss)
+        mc, sc = _ms(cov_pcts)
+        mm = 100.0 - mv
+        missing_color = "#cf6b6b" if mm > 20 else "#62656b"
+
+        aoi_rows = ""
+        for aoi in AOI_NAMES:
+            vals = aoi_frames_all[aoi]
+            if not vals or all(v == 0 for v in vals):
+                continue
+            m, s = _ms(vals)
+            color = AOI_COLORS_QT.get(aoi, QColor("#888")).name()
+            aoi_rows += (
+                f"<tr><td style='color:{color}'><b>{aoi}</b></td>"
+                f"<td>{m:.1f}%{_pm(s)}</td></tr>"
+            )
+
+        html = (
+            "<!DOCTYPE html><html><head><meta charset='utf-8'>"
+            "<style>"
+            "body{background:#0e0f11;color:#e7e8ea;font-family:'Hanken Grotesk',sans-serif;margin:0;padding:20px}"
+            ".grid{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;margin-bottom:20px}"
+            ".card{background:#131416;border:1px solid rgba(255,255,255,.06);border-radius:8px;padding:18px}"
+            ".val{font-size:28px;font-weight:500;margin:8px 0 4px;font-family:'IBM Plex Mono',monospace}"
+            ".lbl{font-size:12px;color:#83868c}"
+            ".section{margin-top:24px}"
+            ".section h3{color:#6a6d73;font-size:11px;letter-spacing:1.1px;text-transform:uppercase;font-weight:500;"
+            "border-bottom:1px solid rgba(255,255,255,.07);padding-bottom:8px;margin-bottom:10px}"
+            "table{width:100%;border-collapse:collapse;font-size:13px}"
+            "td,th{padding:9px 14px 9px 0}"
+            "th{color:#62656b;font-size:11px;letter-spacing:.05em;border-bottom:1px solid rgba(255,255,255,.06)}"
+            "td{border-bottom:1px solid rgba(255,255,255,.04)}"
+            "</style></head><body>"
+            f"<h2 style='margin:0 0 4px;font-size:15px'>Aggregate — {n} recording(s)</h2>"
+            f"<p style='color:#83868c;font-size:12px;margin:0 0 14px'>Mean ± SD across all recordings</p>"
+            "<div class='grid'>"
+            f"<div class='card'><div class='lbl'>Valid Gaze</div>"
+            f"<div class='val' style='color:{_col(mv,80,60)}'>{mv:.1f}%{_pm(sv)}</div>"
+            f"<div class='lbl'>mean across {n} recordings</div></div>"
+            f"<div class='card'><div class='lbl'>Fixations Detected</div>"
+            f"<div class='val' style='color:#6e8fd6'>{mf:.0f}{_pm(sf)}</div>"
+            f"<div class='lbl'>mean per recording</div></div>"
+            f"<div class='card'><div class='lbl'>Duration</div>"
+            f"<div class='val'>{int(md)//60}:{int(md)%60:02d}</div>"
+            f"<div class='lbl'>mean · ±{sd:.0f}s SD</div></div>"
+            f"<div class='card'><div class='lbl'>AOI Coverage</div>"
+            f"<div class='val' style='color:{_col(mc,80,60)}'>{mc:.1f}%{_pm(sc)}</div>"
+            f"<div class='lbl'>frames within an AOI</div></div>"
+            f"<div class='card'><div class='lbl'>Missing Gaze</div>"
+            f"<div class='val' style='color:{missing_color}'>{mm:.1f}%</div>"
+            f"<div class='lbl'>blinks / data loss</div></div>"
+            f"<div class='card'><div class='lbl'>Recordings</div>"
+            f"<div class='val'>{n}</div><div class='lbl'>analysed</div></div>"
+            "</div>"
+            "<div class='section'><h3>Mean AOI Dwell (% of frames)</h3>"
+            "<table><tr><th>AOI</th><th>Mean % ± SD</th></tr>"
+            f"{aoi_rows}</table></div>"
+            "</body></html>"
+        )
+        view.setHtml(html)
+
+    # ── Aggregate Tab 2: Dwell Time ───────────────────────────────────────────
+
+    def _pop_agg_dwell_tab(self, csvs: list[tuple[str, pathlib.Path]]):
+        view = self._agg_tab_views["dwell"]
+        dwell_rows: list[dict] = []
+        fps = 30.0
+        for rec_name, csv_path in csvs:
+            try:
+                df = pd.read_csv(csv_path)
+                lbl_col = "final_primary_aoi" if "final_primary_aoi" in df.columns else "primary_aoi"
+                df["_aoi"] = df[lbl_col].fillna(NONE_LABEL).astype(str)
+                total = max(1, len(df))
+                for aoi in AOI_NAMES:
+                    cnt = int((df["_aoi"] == aoi).sum())
+                    dwell_rows.append({"recording": rec_name, "AOI": aoi,
+                                       "dwell_pct": cnt / total * 100, "dwell_s": cnt / fps})
+            except Exception:
+                pass
+        if not dwell_rows:
+            view.setHtml(self._no_data_html("No dwell data available."))
             return None
-        label_w = 118
-        usable_w = max(1, self.width() - label_w - 16)
-        ratio = max(0.0, min(1.0, (x - label_w) / usable_w))
-        return int(round(ratio * (len(self.labels) - 1)))
+        ddf = pd.DataFrame(dwell_rows)
+        agg = ddf.groupby("AOI")["dwell_pct"].agg(mean="mean", std="std", median="median").reset_index()
+        agg["std"] = agg["std"].fillna(0)
+        n_recs = ddf["recording"].nunique()
+        colors = [AOI_COLORS_QT.get(a, QColor("#6e8fd6")).name() for a in agg["AOI"]]
+        fig = go.Figure()
+        fig.add_trace(go.Bar(
+            x=agg["AOI"], y=agg["mean"],
+            error_y=dict(type="data", array=agg["std"].tolist(), visible=(n_recs > 1)),
+            marker_color=colors,
+            customdata=np.stack([agg["median"], agg["std"]], axis=1),
+            hovertemplate=(
+                "<b>%{x}</b><br>Mean: %{y:.1f}%<br>"
+                "Median: %{customdata[0]:.1f}%<br>SD: %{customdata[1]:.1f}%<extra></extra>"
+            ),
+        ))
+        for rec, grp in ddf.groupby("recording"):
+            fig.add_trace(go.Scatter(
+                x=grp["AOI"], y=grp["dwell_pct"],
+                mode="markers",
+                marker=dict(color="#FFFFFF", size=5, opacity=0.35),
+                showlegend=False,
+                hovertemplate=f"<b>%{{x}}</b><br>{rec}: %{{y:.1f}}%<extra></extra>",
+            ))
+        fig.update_layout(
+            title=f"Gaze Dwell Time per AOI — {n_recs} recording(s)",
+            xaxis_title="AOI", yaxis_title="Mean Dwell (%)",
+            template="aoi_studio", autosize=True, margin=dict(t=50, b=40),
+        )
+        view.setHtml(self._fig_to_html(fig))
+        return fig
+
+    # ── Aggregate Tab 3: Fixation Metrics ─────────────────────────────────────
+
+    def _pop_agg_fixation_tab(self, csvs: list[tuple[str, pathlib.Path]]):
+        view = self._agg_tab_views["fixations"]
+        rows: list[dict] = []
+        for rec_name, csv_path in csvs:
+            rec_dir = self._rec_dir_from_csv(csv_path)
+            for fix_path in [rec_dir / "aoi_results" / "raw" / "fixation_summary.csv",
+                             rec_dir / "aoi_results" / "fixation_summary.csv"]:
+                if fix_path.exists() and fix_path.stat().st_size > 0:
+                    try:
+                        fdf = pd.read_csv(fix_path)
+                        for aoi in AOI_NAMES:
+                            aoi_rows = fdf[fdf["dominant_aoi"] == aoi]
+                            rows.append({
+                                "recording": rec_name, "aoi": aoi,
+                                "count": len(aoi_rows),
+                                "mean_dur": float(aoi_rows["duration_s"].mean())
+                                            if len(aoi_rows) else 0.0,
+                            })
+                    except Exception:
+                        pass
+                    break
+        if not rows:
+            view.setHtml(self._no_data_html(
+                "No fixation_summary.csv found.<br>"
+                "Re-run Analysis on each recording to generate fixation data."))
+            return None
+        fdf2 = pd.DataFrame(rows)
+        agg_c = (fdf2.groupby("aoi")["count"]
+                 .agg(mean="mean", std="std").reset_index()
+                 .set_index("aoi").reindex(AOI_NAMES).reset_index().fillna(0))
+        agg_d = (fdf2.groupby("aoi")["mean_dur"]
+                 .agg(mean="mean", std="std").reset_index()
+                 .set_index("aoi").reindex(AOI_NAMES).reset_index().fillna(0))
+        colors = [AOI_COLORS_QT.get(a, QColor("#6e8fd6")).name() for a in agg_c["aoi"]]
+        n_recs = fdf2["recording"].nunique()
+        fig = make_subplots(rows=1, cols=2,
+                            subplot_titles=("Mean Fixation Count per AOI",
+                                            "Mean Fixation Duration (s)"))
+        fig.add_trace(go.Bar(
+            x=agg_c["aoi"], y=agg_c["mean"],
+            error_y=dict(type="data", array=agg_c["std"].tolist(), visible=(n_recs > 1)),
+            marker_color=colors,
+            hovertemplate="<b>%{x}</b><br>Mean count: %{y:.1f}<extra></extra>"),
+            row=1, col=1)
+        fig.add_trace(go.Bar(
+            x=agg_d["aoi"], y=agg_d["mean"].round(3),
+            error_y=dict(type="data", array=agg_d["std"].tolist(), visible=(n_recs > 1)),
+            marker_color=colors,
+            hovertemplate="<b>%{x}</b><br>Mean dur: %{y:.3f}s<extra></extra>"),
+            row=1, col=2)
+        fig.update_layout(template="aoi_studio", autosize=True,
+                          showlegend=False, margin=dict(t=50, b=40))
+        view.setHtml(self._fig_to_html(fig))
+        return fig
+
+    # ── Aggregate Tab 4: AOI Heatmaps ─────────────────────────────────────────
+
+    def _pop_agg_heatmap_tab(self, csvs: list[tuple[str, pathlib.Path]]):
+        view = self._agg_tab_views["heatmaps"]
+        aoi_gaze: dict[str, tuple[list, list]] = {a: ([], []) for a in AOI_NAMES}
+        for _rec_name, csv_path in csvs:
+            try:
+                df = pd.read_csv(csv_path)
+                if "gaze_on_aoi_x" not in df.columns or "gaze_on_aoi_y" not in df.columns:
+                    continue
+                lbl_col = "final_primary_aoi" if "final_primary_aoi" in df.columns else "primary_aoi"
+                df["_aoi"] = df[lbl_col].fillna(NONE_LABEL).astype(str)
+                for aoi in AOI_NAMES:
+                    sub = df[df["_aoi"] == aoi]
+                    x = pd.to_numeric(sub["gaze_on_aoi_x"], errors="coerce").dropna().values
+                    y = pd.to_numeric(sub["gaze_on_aoi_y"], errors="coerce").dropna().values
+                    mask = (x >= 0) & (x <= 1) & (y >= 0) & (y <= 1)
+                    aoi_gaze[aoi][0].extend(x[mask].tolist())
+                    aoi_gaze[aoi][1].extend(y[mask].tolist())
+            except Exception:
+                pass
+        aois_data = [(aoi, np.array(xs), np.array(ys))
+                     for aoi, (xs, ys) in aoi_gaze.items() if len(xs) >= 10]
+        if not aois_data:
+            view.setHtml(self._no_data_html(
+                "No surface coordinate data available.<br>"
+                "Heatmaps require 3D surface detection (gaze_on_aoi_x/y columns)."))
+            return None
+        from scipy.ndimage import gaussian_filter as _gf
+        n = len(aois_data)
+        cols = min(3, n)
+        rows = (n + cols - 1) // cols
+        fig = make_subplots(rows=rows, cols=cols,
+                            subplot_titles=[a[0] for a in aois_data])
+        for i, (aoi_name, x, y) in enumerate(aois_data):
+            r, c = i // cols + 1, i % cols + 1
+            color = AOI_COLORS_QT.get(aoi_name, QColor("#6e8fd6"))
+            rv, gv, bv = color.red(), color.green(), color.blue()
+            H, xe, ye = np.histogram2d(x, y, bins=25, range=[[0, 1], [0, 1]])
+            Hs = _gf(H.T, sigma=1.5)
+            Hn = Hs / Hs.max() if Hs.max() > 0 else Hs
+            cs = [[0.0, "rgba(0,0,0,0)"],
+                  [0.3, f"rgba({rv},{gv},{bv},0.3)"],
+                  [1.0, f"rgba({rv},{gv},{bv},1.0)"]]
+            fig.add_trace(go.Heatmap(
+                z=Hn, x=xe[:-1] + (xe[1] - xe[0]) / 2, y=ye[:-1] + (ye[1] - ye[0]) / 2,
+                colorscale=cs, showscale=False,
+                hovertemplate=f"X:%{{x:.2f}} Y:%{{y:.2f}}<br>Density:%{{z:.2f}}<extra>{aoi_name}</extra>",
+            ), row=r, col=c)
+        fig.update_xaxes(range=[0, 1], showticklabels=False, showgrid=False)
+        fig.update_yaxes(range=[0, 1], showticklabels=False, showgrid=False)
+        fig.update_layout(
+            title=f"Pooled Spatial Gaze Distribution — {len(csvs)} recording(s)",
+            template="aoi_studio",
+            height=max(360, 340 * rows),
+            margin=dict(t=60, b=20))
+        view.setHtml(self._fig_to_html(fig))
+        return fig
+
+    # ── Aggregate Tab 5: Transition Matrix ────────────────────────────────────
+
+    def _pop_agg_transition_tab(self, csvs: list[tuple[str, pathlib.Path]]):
+        view = self._agg_tab_views["transitions"]
+        matrices: list[pd.DataFrame] = []
+        for _rec_name, csv_path in csvs:
+            try:
+                df = pd.read_csv(csv_path)
+                lbl_col = "final_primary_aoi" if "final_primary_aoi" in df.columns else "primary_aoi"
+                labels = df[lbl_col].fillna(NONE_LABEL).astype(str)
+                matrix = pd.DataFrame(0, index=AOI_NAMES, columns=AOI_NAMES, dtype=int)
+                arr = labels.values
+                for i in range(len(arr) - 1):
+                    src, dst = str(arr[i]), str(arr[i + 1])
+                    if src != dst and src in matrix.index and dst in matrix.columns:
+                        matrix.loc[src, dst] += 1
+                row_sums = matrix.sum(axis=1)
+                normed = (matrix.div(row_sums.replace(0, np.nan), axis=0)
+                          .fillna(0) * 100).round(1)
+                matrices.append(normed)
+            except Exception:
+                pass
+        if not matrices:
+            view.setHtml(self._no_data_html("No transition data available."))
+            return None
+        avg = matrices[0].copy().astype(float)
+        for m in matrices[1:]:
+            avg = avg.add(m.astype(float), fill_value=0.0)
+        avg = (avg / len(matrices)).round(1)
+        if avg.values.sum() == 0:
+            view.setHtml(self._no_data_html("No AOI transitions found across recordings."))
+            return None
+        fig = go.Figure(go.Heatmap(
+            z=avg.values.tolist(),
+            x=list(avg.columns),
+            y=list(avg.index),
+            colorscale="Blues",
+            text=avg.values.round(1).tolist(),
+            texttemplate="%{text}",
+            textfont=dict(size=11),
+            hovertemplate="From: %{y}<br>To: %{x}<br>%{z:.1f}%<extra></extra>",
+        ))
+        fig.update_layout(
+            title=f"Mean AOI Transition Probabilities — {len(csvs)} recording(s)",
+            template="aoi_studio",
+            height=max(360, 50 * len(AOI_NAMES) + 160),
+            xaxis_title="To AOI", yaxis_title="From AOI",
+            margin=dict(t=60, b=60, l=110, r=40))
+        view.setHtml(self._fig_to_html(fig))
+        return fig
+
+    # ── Aggregate Tab 6: Learning Curve ───────────────────────────────────────
+
+    def _pop_agg_learning_tab(self, csvs: list[tuple[str, pathlib.Path]],
+                              task_filter: str):
+        view = self._agg_tab_views["learning"]
+        task_rows: list[dict] = []
+        fps = 30.0
+        for rec_name, csv_path in csvs:
+            rec_dir = self._rec_dir_from_csv(csv_path)
+            task_path = None
+            for p in [rec_dir / "aoi_results" / "tasks.json",
+                      rec_dir / "aoi_results" / "raw" / "tasks.json"]:
+                if p.exists():
+                    task_path = p
+                    break
+            if task_path is None:
+                continue
+            try:
+                tasks = json.loads(task_path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            try:
+                df_head = pd.read_csv(csv_path, usecols=["time_s"])
+                times = pd.to_numeric(df_head["time_s"], errors="coerce").dropna()
+                if len(times) > 1:
+                    dur = float(times.iloc[-1] - times.iloc[0])
+                    if dur > 0:
+                        fps = max(1.0, (len(times) - 1) / dur)
+            except Exception:
+                pass
+            for t_name, t_data in tasks.items():
+                s, e = t_data.get("start"), t_data.get("end")
+                if s is None or e is None or e <= s:
+                    continue
+                digits = "".join(c for c in t_name if c.isdigit())
+                task_rows.append({
+                    "recording": rec_name, "task": t_name,
+                    "task_idx": int(digits) if digits else 0,
+                    "dur_s": (e - s) / fps,
+                })
+        if not task_rows:
+            view.setHtml(self._no_data_html(
+                "No task annotations found.<br>"
+                "Annotate tasks T1–T10 in the Studio tab and click Save Tasks."))
+            return None
+        tdf = pd.DataFrame(task_rows)
+        if task_filter != "All Tasks":
+            tdf = tdf[tdf["task"] == task_filter]
+        if tdf.empty:
+            view.setHtml(self._no_data_html(f"No data for filter: {task_filter}"))
+            return None
+        n_recs = tdf["recording"].nunique()
+        agg = (tdf.groupby("task_idx")["dur_s"]
+               .agg(mean="mean", std="std", median="median", n="count")
+               .reset_index().sort_values("task_idx"))
+        agg["std"] = agg["std"].fillna(0)
+        fig = go.Figure()
+        if n_recs > 1:
+            x_l = agg["task_idx"].tolist()
+            fig.add_trace(go.Scatter(
+                x=x_l + x_l[::-1],
+                y=(agg["mean"] + agg["std"]).tolist() +
+                  (agg["mean"] - agg["std"]).tolist()[::-1],
+                fill="toself", fillcolor="rgba(88,166,255,0.12)",
+                line=dict(color="rgba(0,0,0,0)"),
+                showlegend=False, hoverinfo="skip",
+            ))
+            for rn, rg in tdf.groupby("recording"):
+                rg = rg.sort_values("task_idx")
+                fig.add_trace(go.Scatter(
+                    x=rg["task_idx"], y=rg["dur_s"],
+                    mode="lines+markers",
+                    line=dict(width=1, color="#3a3d43"),
+                    marker=dict(size=4),
+                    name=rn, showlegend=False,
+                ))
+        fig.add_trace(go.Scatter(
+            x=agg["task_idx"], y=agg["mean"],
+            mode="lines+markers",
+            line=dict(width=3, color="#6e8fd6"),
+            marker=dict(size=8, color="#6e8fd6"),
+            name="Mean",
+            customdata=np.stack([agg["median"], agg["std"], agg["n"]], axis=1),
+            hovertemplate=(
+                "Task %{x}<br>Mean: %{y:.1f}s<br>"
+                "Median: %{customdata[0]:.1f}s<br>"
+                "SD: %{customdata[1]:.1f}s<br>"
+                "n=%{customdata[2]}<extra></extra>"
+            ),
+        ))
+        fig.update_layout(
+            title=f"Learning Curve — Task Duration over Repetitions — {n_recs} recording(s)",
+            xaxis=dict(title="Task Number", dtick=1),
+            yaxis_title="Duration (s)",
+            template="aoi_studio", autosize=True,
+            showlegend=False, margin=dict(t=50, b=40))
+        view.setHtml(self._fig_to_html(fig))
+        return fig
+
+    # ── Build figures ─────────────────────────────────────────────────────────
+
+    def _build_figures(
+        self,
+        csvs: list[tuple[str, pathlib.Path]],
+        folder: str,
+        task_filter: str,
+    ) -> tuple[list[tuple[str, "go.Figure"]], str]:
+        """Returns ([(slug, fig), ...], stats_html)."""
+        dfs: list[pd.DataFrame] = []
+        for rec_name, p in csvs:
+            try:
+                df = pd.read_csv(p)
+                df["recording"] = rec_name
+                dfs.append(df)
+            except Exception:
+                pass
+        if not dfs:
+            return [], ""
+
+        combined = pd.concat(dfs, ignore_index=True)
+        lbl_col  = "final_primary_aoi" if "final_primary_aoi" in combined.columns else "primary_aoi"
+        combined["aoi"] = combined[lbl_col].fillna(NONE_LABEL).astype(str)
+        fps = 30.0
+
+        # Dwell stats per recording
+        dwell_rows: list[dict] = []
+        for rec_name, grp in combined.groupby("recording"):
+            total = max(1, len(grp))
+            for aoi in AOI_NAMES:
+                cnt = int((grp["aoi"] == aoi).sum())
+                dwell_rows.append({
+                    "recording": rec_name, "AOI": aoi,
+                    "dwell_s": cnt / fps, "dwell_pct": cnt / total * 100,
+                })
+        dwell_df = pd.DataFrame(dwell_rows)
+
+        result: list[tuple[str, go.Figure]] = []
+
+        # Chart 1: AOI dwell bar
+        if not dwell_df.empty:
+            agg = dwell_df.groupby("AOI")["dwell_pct"].agg(["mean", "std", "median"]).reset_index()
+            agg["std"] = agg["std"].fillna(0)
+            n_recs = dwell_df["recording"].nunique()
+            colors_bar = [AOI_COLORS_QT.get(a, QColor("#6b6e74")).name() for a in agg["AOI"]]
+            fig1 = go.Figure()
+            fig1.add_trace(go.Bar(
+                x=agg["AOI"], y=agg["mean"],
+                error_y=dict(type="data", array=agg["std"].tolist(), visible=(n_recs > 1)),
+                marker_color=colors_bar,
+                name="Mean dwell %",
+                customdata=np.stack([agg["median"], agg["std"]], axis=1),
+                hovertemplate=(
+                    "<b>%{x}</b><br>Mean: %{y:.1f}%<br>"
+                    "Median: %{customdata[0]:.1f}%<br>"
+                    "Std: %{customdata[1]:.1f}%<extra></extra>"
+                ),
+            ))
+            title_suffix = f" — {folder}" + (f" · {n_recs} recordings" if n_recs > 1 else "")
+            fig1.update_layout(
+                title=f"AOI Dwell Time{title_suffix}",
+                xaxis_title="AOI", yaxis_title="Mean Dwell (%)",
+                template="aoi_studio", height=380, margin=dict(t=50, b=40),
+            )
+            result.append(("01_aoi_dwell", fig1))
+
+        # Chart 2: Learning curve
+        task_rows: list[dict] = []
+        for rec_name, p in csvs:
+            task_path = p.parent.parent / "tasks.json"
+            if not task_path.exists():
+                task_path = p.parent / "tasks.json"
+            if not task_path.exists():
+                continue
+            try:
+                tasks = json.loads(task_path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            for t_name, t_data in tasks.items():
+                s, e = t_data.get("start"), t_data.get("end")
+                if s is None or e is None or e <= s:
+                    continue
+                digits = "".join(c for c in t_name if c.isdigit())
+                task_rows.append({
+                    "recording": rec_name, "task": t_name,
+                    "task_idx": int(digits) if digits else 0,
+                    "dur_s": (e - s) / fps,
+                })
+
+        if task_rows:
+            tdf = pd.DataFrame(task_rows)
+            if task_filter != "All Tasks":
+                tdf = tdf[tdf["task"] == task_filter]
+            if not tdf.empty:
+                agg_t = tdf.groupby("task_idx")["dur_s"].agg(
+                    mean="mean", std="std", median="median", n="count"
+                ).reset_index().sort_values("task_idx")
+                agg_t["std"] = agg_t["std"].fillna(0)
+                fig2 = go.Figure()
+                n_recs2 = tdf["recording"].nunique()
+                if n_recs2 > 1:
+                    fig2.add_trace(go.Scatter(
+                        x=pd.concat([agg_t["task_idx"], agg_t["task_idx"][::-1]]),
+                        y=pd.concat([agg_t["mean"] + agg_t["std"],
+                                     (agg_t["mean"] - agg_t["std"])[::-1]]),
+                        fill="toself", fillcolor="rgba(88,166,255,0.15)",
+                        line=dict(color="rgba(0,0,0,0)"),
+                        showlegend=False, hoverinfo="skip",
+                    ))
+                    for rn, rg in tdf.groupby("recording"):
+                        rg = rg.sort_values("task_idx")
+                        fig2.add_trace(go.Scatter(
+                            x=rg["task_idx"], y=rg["dur_s"],
+                            mode="lines+markers",
+                            line=dict(width=1, color="#3a3d43"),
+                            marker=dict(size=4),
+                            name=rn, showlegend=False,
+                        ))
+                fig2.add_trace(go.Scatter(
+                    x=agg_t["task_idx"], y=agg_t["mean"],
+                    mode="lines+markers",
+                    line=dict(width=3, color="#6e8fd6"),
+                    marker=dict(size=8, color="#6e8fd6"),
+                    name="Mean",
+                    customdata=np.stack([agg_t["median"], agg_t["std"], agg_t["n"]], axis=1),
+                    hovertemplate=(
+                        "Task %{x}<br>Mean: %{y:.1f}s<br>"
+                        "Median: %{customdata[0]:.1f}s<br>"
+                        "Std: %{customdata[1]:.1f}s<br>"
+                        "N=%{customdata[2]}<extra></extra>"
+                    ),
+                ))
+                fig2.update_layout(
+                    title="Learning Curve — Task Duration over Tasks",
+                    xaxis=dict(title="Task Number", dtick=1),
+                    yaxis_title="Duration (s)",
+                    template="aoi_studio", height=360, margin=dict(t=50, b=40),
+                )
+                result.append(("02_learning_curve", fig2))
+
+        # Chart 3: Per-recording heatmap (>1 recording only)
+        if not dwell_df.empty and dwell_df["recording"].nunique() > 1:
+            pivot = dwell_df.pivot(index="recording", columns="AOI",
+                                   values="dwell_pct").fillna(0)
+            fig3 = px.imshow(
+                pivot, aspect="auto", color_continuous_scale="Blues",
+                title="Dwell % per Recording (heatmap)",
+                labels=dict(x="AOI", y="Recording", color="Dwell %"),
+            )
+            fig3.update_layout(
+                template="aoi_studio",
+                height=max(220, 36 * len(pivot) + 100),
+                margin=dict(t=50, b=40),
+            )
+            result.append(("03_dwell_heatmap", fig3))
+
+        # Stats table HTML
+        stats_html = ""
+        if not dwell_df.empty:
+            agg_tbl = dwell_df.groupby("AOI")["dwell_pct"].agg(
+                ["mean", "median", "std", "min", "max"]
+            ).round(1).reset_index()
+            _fallback = QColor("#aaa")
+            rows = "".join(
+                "<tr>"
+                f"<td style='color:{AOI_COLORS_QT.get(r.AOI, _fallback).name()}'>"
+                f"<b>{r.AOI}</b></td>"
+                f"<td>{r.mean}%</td><td>{r.median}%</td>"
+                f"<td>{r.std}%</td><td>{r.min}%</td><td>{r.max}%</td></tr>"
+                for r in agg_tbl.itertuples()
+            )
+            stats_html = (
+                "<h4 style='color:#9b9ea4;margin:16px 0 8px'>AOI Dwell Statistics</h4>"
+                "<table style='border-collapse:collapse;font-size:12px;width:100%'>"
+                "<tr style='border-bottom:1px solid rgba(255,255,255,.07);color:#9b9ea4'>"
+                "<th style='text-align:left;padding:4px 12px 4px 0'>AOI</th>"
+                "<th>Mean</th><th>Median</th><th>Std</th><th>Min</th><th>Max</th></tr>"
+                + rows + "</table>"
+            )
+
+        return result, stats_html
+
+    # ── Render HTML from figures ──────────────────────────────────────────────
+
+    def _render_html(self, figs: list[tuple[str, "go.Figure"]], stats_html: str) -> str:
+        if not figs and not stats_html:
+            return "<body style='background:#0e0f11;color:#e7e8ea;padding:20px'>No readable data.</body>"
+        parts: list[str] = []
+        first = True
+        for _slug, fig in figs:
+            parts.append(fig.to_html(
+                full_html=False,
+                include_plotlyjs="cdn" if first else False,
+            ))
+            first = False
+        body = "<hr style='border-color:rgba(255,255,255,.07);margin:16px 0'>".join(parts) + stats_html
+        return (
+            "<!DOCTYPE html><html><head><meta charset='utf-8'>"
+            "<style>body{background:#0e0f11;color:#e7e8ea;"
+            "font-family:'Hanken Grotesk',sans-serif;margin:0;padding:12px}"
+            "td,th{padding:4px 12px 4px 0}</style>"
+            f"</head><body>{body}</body></html>"
+        )
+
+    # ── Export PNGs ───────────────────────────────────────────────────────────
+
+    def _export_png(self) -> None:
+        if self._stack.currentIndex() == 1:
+            self._export_png_single()
+        else:
+            self._export_png_aggregate()
+
+    def _export_png_aggregate(self) -> None:
+        src, rec_filter, csvs = self._collect_csvs()
+        if src is None or not csvs:
+            self._status.setText("Load charts first.")
+            return
+        task_filter = self._task_combo.currentText()
+        self._status.setText("Rendering PNGs…")
+        QApplication.processEvents()
+        # Rebuild all Plotly-based aggregate figures for export
+        named_figs: list[tuple[str, object]] = []
+        for slug, method, args in [
+            ("01_agg_dwell",       self._pop_agg_dwell_tab,      (csvs,)),
+            ("02_agg_fixations",   self._pop_agg_fixation_tab,   (csvs,)),
+            ("03_agg_heatmaps",    self._pop_agg_heatmap_tab,    (csvs,)),
+            ("04_agg_transitions", self._pop_agg_transition_tab, (csvs,)),
+            ("05_agg_learning",    self._pop_agg_learning_tab,   (csvs, task_filter)),
+        ]:
+            try:
+                fig = method(*args)
+                if fig is not None:
+                    named_figs.append((slug, fig))
+            except Exception:
+                pass
+        if not named_figs:
+            self._status.setText("No charts to export.")
+            return
+        out_dir = (src / reporting.SUMMARY_DIR_NAME) if rec_filter is None \
+                  else (rec_filter / "aoi_results" / "charts")
+        out_dir.mkdir(parents=True, exist_ok=True)
+        saved: list[pathlib.Path] = []
+        for slug, fig in named_figs:
+            path = out_dir / f"{slug}.png"
+            try:
+                fig.write_image(str(path), width=1400, height=fig.layout.height or 400, scale=2)
+                saved.append(path)
+            except Exception as exc:
+                self._status.setText(f"PNG render failed: {exc}")
+                return
+        self._status.setText(f"Saved {len(saved)} PNG(s) → {out_dir}")
+        QMessageBox.information(self, APP_TITLE,
+            f"Saved {len(saved)} chart(s) to:\n{out_dir}\n\n"
+            + "\n".join(p.name for p in saved))
+
+    def _export_png_single(self) -> None:
+        _, rec_filter, csvs = self._collect_csvs()
+        if rec_filter is None or not csvs:
+            self._status.setText("Select a single recording first.")
+            return
+        task_filter = self._task_combo.currentText()
+        self._status.setText("Rendering PNGs…")
+        QApplication.processEvents()
+
+        try:
+            df = pd.read_csv(csvs[0][1])
+        except Exception as exc:
+            self._status.setText(f"Could not read CSV: {exc}")
+            return
+
+        lbl_col = "final_primary_aoi" if "final_primary_aoi" in df.columns else "primary_aoi"
+        df["_aoi"] = df[lbl_col].fillna(NONE_LABEL).astype(str)
+        total = len(df)
+        fps = 30.0
+
+        out_dir = rec_filter / "aoi_results" / "charts"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        saved: list[pathlib.Path] = []
+
+        # Build and save each chart
+        def _save(slug, fig):
+            p = out_dir / f"{slug}.png"
+            try:
+                fig.write_image(str(p), width=1400, height=fig.layout.height or 400, scale=2)
+                saved.append(p)
+            except Exception as exc:
+                self._status.setText(f"PNG failed for {slug}: {exc}")
+
+        # Dwell chart
+        rows = [{"aoi": aoi, "dwell_pct": int((df["_aoi"] == aoi).sum()) / total * 100}
+                for aoi in AOI_NAMES]
+        ddf   = pd.DataFrame(rows)
+        colors = [AOI_COLORS_QT.get(a, QColor("#6e8fd6")).name() for a in ddf["aoi"]]
+        fig_d = go.Figure(go.Bar(x=ddf["aoi"], y=ddf["dwell_pct"], marker_color=colors))
+        fig_d.update_layout(title="Dwell Time per AOI", template="aoi_studio", height=400)
+        _save("01_dwell", fig_d)
+
+        # Transition matrix
+        labels = df["_aoi"].values
+        matrix = pd.DataFrame(0, index=AOI_NAMES, columns=AOI_NAMES, dtype=int)
+        for i in range(len(labels) - 1):
+            src, dst = str(labels[i]), str(labels[i + 1])
+            if src != dst and src in matrix.index and dst in matrix.columns:
+                matrix.loc[src, dst] += 1
+        row_sums = matrix.sum(axis=1)
+        normed = (matrix.div(row_sums.replace(0, np.nan), axis=0).fillna(0) * 100).round(1)
+        if normed.values.sum() > 0:
+            fig_t = go.Figure(go.Heatmap(z=normed.values.tolist(),
+                                         x=list(normed.columns), y=list(normed.index),
+                                         colorscale="Blues"))
+            fig_t.update_layout(title="Transition Matrix", template="aoi_studio", height=400)
+            _save("02_transitions", fig_t)
+
+        # Heatmaps (if data exists)
+        if "gaze_on_aoi_x" in df.columns and "gaze_on_aoi_y" in df.columns:
+            from scipy.ndimage import gaussian_filter as _gf
+            aois_data = []
+            for aoi in AOI_NAMES:
+                sub = df[df["_aoi"] == aoi]
+                x = pd.to_numeric(sub["gaze_on_aoi_x"], errors="coerce").dropna().values
+                y = pd.to_numeric(sub["gaze_on_aoi_y"], errors="coerce").dropna().values
+                m = (x >= 0) & (x <= 1) & (y >= 0) & (y <= 1)
+                if m.sum() >= 10:
+                    aois_data.append((aoi, x[m], y[m]))
+            if aois_data:
+                n = len(aois_data)
+                cols = min(3, n)
+                rows_n = (n + cols - 1) // cols
+                fig_h = make_subplots(rows=rows_n, cols=cols,
+                                      subplot_titles=[a[0] for a in aois_data])
+                for i, (aoi_name, x, y) in enumerate(aois_data):
+                    r, c = i // cols + 1, i % cols + 1
+                    color = AOI_COLORS_QT.get(aoi_name, QColor("#6e8fd6"))
+                    rv, gv, bv = color.red(), color.green(), color.blue()
+                    H, xe, ye = np.histogram2d(x, y, bins=25, range=[[0, 1], [0, 1]])
+                    Hn = _gf(H.T, sigma=1.5)
+                    if Hn.max() > 0:
+                        Hn /= Hn.max()
+                    cs = [[0.0, "rgba(0,0,0,0)"],
+                          [0.3, f"rgba({rv},{gv},{bv},0.3)"],
+                          [1.0, f"rgba({rv},{gv},{bv},1.0)"]]
+                    fig_h.add_trace(go.Heatmap(
+                        z=Hn, x=xe[:-1], y=ye[:-1], colorscale=cs, showscale=False
+                    ), row=r, col=c)
+                fig_h.update_layout(title="AOI Heatmaps", template="aoi_studio",
+                                    height=max(360, 340 * rows_n))
+                _save("03_heatmaps", fig_h)
+
+        self._status.setText(f"Saved {len(saved)} PNG(s) → {out_dir}")
+        QMessageBox.information(self, APP_TITLE,
+            f"Saved {len(saved)} chart(s) to:\n{out_dir}\n\n"
+            + "\n".join(p.name for p in saved))
+
+    # ── Export workbook ───────────────────────────────────────────────────────
+
+    def _export_workbook(self) -> None:
+        src = self._current_source()
+        if src is None:
+            return
+        try:
+            out = reporting.generate_master_outputs(src)
+            QMessageBox.information(
+                self, APP_TITLE,
+                f"Workbook saved:\n{out.workbook_path}\n\n"
+                f"Recordings: {out.recording_count}  Tasks: {out.task_count}",
+            )
+        except Exception as exc:
+            QMessageBox.warning(self, APP_TITLE, f"Export failed:\n{exc}")
 
 
-class NeonAoiQtApp(QMainWindow):
+# ─── Comparison tab ───────────────────────────────────────────────────────────
+
+_REC_TAB_DEFS = [
+    ("dq",           "Data Quality"),
+    ("dwell",        "Dwell Time"),
+    ("fixations",    "Fixation Metrics"),
+    ("heatmaps",     "AOI Heatmaps"),
+    ("transitions",  "Transition Matrix"),
+    ("learning",     "Learning Curve"),
+]
+
+_TAB_DEFS = [
+    ("01_dwell_pct",          "Dwell %"),
+    ("02_fixation_count",     "Fixation Count"),
+    ("03_fixation_duration",  "Fixation Duration"),
+    ("04_entropy_transition", "Entropy & Transitions"),
+    ("05_transition_matrices","Transition Matrices"),
+    ("06_learning_curves",    "Learning Curves"),
+    ("__stats__",             "Statistics"),
+]
+
+_CHART_PLACEHOLDER = (
+    "<!DOCTYPE html><html><head><meta charset='utf-8'>"
+    "<style>body{background:#0e0f11;color:#3a3d43;font-family:'Hanken Grotesk',sans-serif;"
+    "display:flex;align-items:center;justify-content:center;"
+    "height:95vh;margin:0;font-size:14px}</style>"
+    "</head><body>Run comparison to populate this chart.</body></html>"
+)
+
+class ComparisonWidget(QWidget):
+    """
+    Condition Comparison tab (NonGamified vs Gamified).
+    Runs reporting.compare_conditions() in a background thread and renders
+    7 Plotly charts + a statistical summary table.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._worker: Optional[ComparisonWorker] = None
+        self._last_report = None
+        self._build_ui()
+        self._populate_combos()
+
+    # ── UI construction ──────────────────────────────────────────────────────
+
+    def _build_ui(self) -> None:
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(12)
+
+        # ── Left sidebar: all controls, stacked vertically ──────────────────────
+        sidebar = QFrame()
+        sidebar.setObjectName("leftPanel")
+        sidebar.setFixedWidth(224)
+        side_l = QVBoxLayout(sidebar)
+        side_l.setContentsMargins(16, 18, 16, 18)
+        side_l.setSpacing(10)
+
+        self._cond_a_combo = QComboBox()
+        self._cond_a_combo.setToolTip("Condition A (e.g. NonGamified)")
+
+        self._cond_b_combo = QComboBox()
+        self._cond_b_combo.setToolTip("Condition B (e.g. Gamified)")
+
+        self._run_btn = QPushButton("Run Comparison")
+        self._run_btn.setObjectName("primaryButton")
+
+        self._png_btn = QPushButton("📷  Save PNGs")
+
+        side_l.addWidget(QLabel("Condition A:"))
+        side_l.addWidget(self._cond_a_combo)
+        side_l.addWidget(QLabel("Condition B:"))
+        side_l.addWidget(self._cond_b_combo)
+
+        _div1 = QFrame(); _div1.setFrameShape(QFrame.HLine); _div1.setObjectName("divider")
+        side_l.addWidget(_div1)
+
+        side_l.addWidget(self._run_btn)
+        side_l.addWidget(self._png_btn)
+        side_l.addStretch(1)
+
+        self._status = QLabel("Select two conditions and click Run Comparison.")
+        self._status.setWordWrap(True)
+        self._status.setStyleSheet(f"color: {Theme.TEXT_FAINT}; font-size: 12px;")
+        side_l.addWidget(self._status)
+
+        layout.addWidget(sidebar)
+
+        # ── Right: chart area fills all remaining space ─────────────────────────
+        # Sub-tabs — one per chart
+        self._chart_tabs = QTabWidget()
+        self._tab_views: dict[str, QWebEngineView] = {}
+        for slug, label in _TAB_DEFS:
+            view = QWebEngineView()
+            view.setHtml(_CHART_PLACEHOLDER)
+            self._chart_tabs.addTab(view, f"  {label}  ")
+            self._tab_views[slug] = view
+
+        layout.addWidget(self._chart_tabs, 1)
+
+        self._run_btn.clicked.connect(self._run)
+        self._png_btn.clicked.connect(self._export_png)
+
+    def _populate_combos(self) -> None:
+        self._cond_a_combo.clear()
+        self._cond_b_combo.clear()
+        dirs = list_source_folders()
+        for d in dirs:
+            self._cond_a_combo.addItem(d.name, userData=d)
+            self._cond_b_combo.addItem(d.name, userData=d)
+        if len(dirs) >= 2:
+            self._cond_b_combo.setCurrentIndex(1)
+
+    # ── Run ──────────────────────────────────────────────────────────────────
+
+    def _run(self) -> None:
+        cond_a: Optional[pathlib.Path] = self._cond_a_combo.currentData()
+        cond_b: Optional[pathlib.Path] = self._cond_b_combo.currentData()
+        if cond_a is None or cond_b is None:
+            return
+        if cond_a == cond_b:
+            self._status.setText("Select two different condition folders.")
+            return
+        if self._worker is not None and self._worker.is_alive():
+            return
+        self._run_btn.setEnabled(False)
+        self._status.setText("Loading recordings and computing statistics…")
+        QApplication.processEvents()
+        worker = ComparisonWorker(cond_a, cond_b)
+        worker.signals.finished.connect(self._on_done)
+        worker.signals.failed.connect(self._on_failed)
+        self._worker = worker
+        worker.start()
+
+    def _on_done(self) -> None:
+        self._run_btn.setEnabled(True)
+        report = self._worker.result
+        self._last_report = report
+        figs = self._build_figures(report)
+        fig_dict = {slug: fig for slug, fig in figs}
+        for slug, view in self._tab_views.items():
+            if slug == "__stats__":
+                view.setHtml(self._stats_page_html(report))
+            elif slug in fig_dict:
+                view.setHtml(self._fig_to_html(fig_dict[slug]))
+        scipy_note = "scipy ✓" if reporting._SCIPY_OK else "⚠ scipy missing — p-values unavailable"
+        self._status.setText(
+            f"{report.condition_a}: {report.n_a} recording(s)   ·   "
+            f"{report.condition_b}: {report.n_b} recording(s)   ·   {scipy_note}"
+        )
+
+    def _on_failed(self, msg: str) -> None:
+        self._run_btn.setEnabled(True)
+        self._status.setText(f"Error: {msg}")
+        QMessageBox.warning(self, APP_TITLE, f"Comparison failed:\n{msg}")
+
+    # ── Figure building ───────────────────────────────────────────────────────
+
+    @staticmethod
+    def _sig_marker(p) -> str:
+        try:
+            pf = float(p)
+        except (TypeError, ValueError):
+            return ""
+        if math.isnan(pf):
+            return ""
+        if pf < 0.001: return "***"
+        if pf < 0.01:  return "**"
+        if pf < 0.05:  return "*"
+        return ""
+
+    def _build_figures(self, report) -> list[tuple[str, object]]:
+        result: list[tuple[str, object]] = []
+        cond_a, cond_b = report.condition_a, report.condition_b
+        col_a,  col_b  = _COND_COLORS
+        fill_a, fill_b = _COND_FILL_COLORS
+
+        # ── Grouped-bar helper (charts 1-3) ──────────────────────────────────
+        def _grouped_bar(metric_label: str, y_title: str, slug: str,
+                         rec_attr: str, title: str) -> None:
+            df = report.aoi_stats[report.aoi_stats["metric"] == metric_label].copy()
+            if df.empty:
+                return
+            # Skip if all zeros (fixation data not yet available)
+            if df[f"{cond_a}_mean"].sum() + df[f"{cond_b}_mean"].sum() == 0:
+                return
+            fig = go.Figure()
+            for cond, col, recs in [
+                (cond_a, col_a, report.recordings_a),
+                (cond_b, col_b, report.recordings_b),
+            ]:
+                fig.add_trace(go.Bar(
+                    x=df["aoi"], y=df[f"{cond}_mean"],
+                    error_y=dict(type="data", array=df[f"{cond}_std"].tolist(), visible=True),
+                    name=cond, marker_color=col,
+                    hovertemplate=f"<b>%{{x}}</b><br>Mean: %{{y:.3f}}<extra>{cond}</extra>",
+                ))
+                # Individual recording dots
+                for aoi in df["aoi"]:
+                    pts = [getattr(r, rec_attr).get(aoi, 0.0) for r in recs]
+                    if pts:
+                        fig.add_trace(go.Scatter(
+                            x=[aoi] * len(pts), y=pts,
+                            mode="markers",
+                            marker=dict(color=col, size=6, opacity=0.55),
+                            showlegend=False, hoverinfo="skip",
+                        ))
+            # Significance markers
+            for _, row in df.iterrows():
+                marker = self._sig_marker(row["p_value"])
+                if marker:
+                    max_y = max(
+                        float(row[f"{cond_a}_mean"]) + float(row[f"{cond_a}_std"]),
+                        float(row[f"{cond_b}_mean"]) + float(row[f"{cond_b}_std"]),
+                    )
+                    fig.add_annotation(
+                        x=row["aoi"], y=max_y * 1.08, text=marker,
+                        showarrow=False, font=dict(size=13, color="white"),
+                        xref="x", yref="y",
+                    )
+            fig.update_layout(
+                title=f"{title}   (* p<0.05  ** p<0.01  *** p<0.001)",
+                barmode="group", template="aoi_studio", autosize=True,
+                xaxis_title="AOI", yaxis_title=y_title,
+                legend=dict(orientation="h", y=1.08),
+                margin=dict(t=65, b=40),
+            )
+            result.append((slug, fig))
+
+        _grouped_bar("Dwell %",                   "Mean Dwell (%)",              "01_dwell_pct",         "dwell_pct",      "AOI Gaze Dwell Time")
+        _grouped_bar("Fixation Count",             "Mean Fixation Count",         "02_fixation_count",    "fixation_count", "Fixation Count per AOI")
+        _grouped_bar("Mean Fixation Duration (s)", "Mean Fixation Duration (s)",  "03_fixation_duration", "mean_fix_dur",   "Mean Fixation Duration per AOI")
+
+        # ── Chart 4: Gaze Entropy + Transition Rate ───────────────────────────
+        if not report.overall_stats.empty:
+            fig = make_subplots(
+                rows=1, cols=2,
+                subplot_titles=("Gaze Entropy (bits)", "Transition Rate (per sec)"),
+            )
+            overall_metrics = [
+                ("Gaze Entropy (bits)",        "entropy",         1),
+                ("Transition Rate (per sec)",   "transition_rate", 2),
+            ]
+            first_legend = True
+            for label, attr, col_n in overall_metrics:
+                ov_rows = report.overall_stats[report.overall_stats["metric"] == label]
+                if ov_rows.empty:
+                    continue
+                ov = ov_rows.iloc[0]
+                for cond, col, recs in [
+                    (cond_a, col_a, report.recordings_a),
+                    (cond_b, col_b, report.recordings_b),
+                ]:
+                    show_leg = first_legend
+                    fig.add_trace(go.Bar(
+                        x=[cond], y=[ov[f"{cond}_mean"]],
+                        error_y=dict(type="data", array=[ov[f"{cond}_std"]], visible=True),
+                        name=cond, marker_color=col, showlegend=show_leg,
+                    ), row=1, col=col_n)
+                    pts = [getattr(r, attr) for r in recs]
+                    if pts:
+                        fig.add_trace(go.Scatter(
+                            x=[cond] * len(pts), y=pts,
+                            mode="markers",
+                            marker=dict(color=col, size=8, opacity=0.6),
+                            showlegend=False, hoverinfo="skip",
+                        ), row=1, col=col_n)
+                first_legend = False
+            fig.update_layout(
+                barmode="group", template="aoi_studio", autosize=True,
+                margin=dict(t=60, b=40),
+                legend=dict(orientation="h", y=1.12),
+            )
+            result.append(("04_entropy_transition", fig))
+
+        # ── Chart 5: Transition matrices ──────────────────────────────────────
+        tm_a, tm_b = report.trans_matrix_a, report.trans_matrix_b
+        if not tm_a.empty and not tm_b.empty:
+            zmax = max(float(tm_a.values.max()), float(tm_b.values.max()), 1.0)
+            n_aoi = len(tm_a)
+            fig = make_subplots(
+                rows=1, cols=2,
+                subplot_titles=(
+                    f"Transitions — {cond_a}",
+                    f"Transitions — {cond_b}",
+                ),
+            )
+            for col_n, tm in enumerate([tm_a, tm_b], start=1):
+                fig.add_trace(go.Heatmap(
+                    z=tm.values.tolist(),
+                    x=list(tm.columns),
+                    y=list(tm.index),
+                    colorscale="Blues", zmin=0, zmax=zmax,
+                    showscale=(col_n == 2),
+                    hovertemplate="From: %{y}<br>To: %{x}<br>%{z:.1f}%<extra></extra>",
+                ), row=1, col=col_n)
+            fig.update_layout(
+                title="AOI Transition Probabilities — row→column (% of outgoing transitions)",
+                template="aoi_studio",
+                height=max(320, 42 * n_aoi + 130),
+                margin=dict(t=65, b=50, l=90, r=60),
+            )
+            result.append(("05_transition_matrices", fig))
+
+        # ── Chart 6: Learning curves ──────────────────────────────────────────
+        ldf = report.learning_df
+        if not ldf.empty:
+            metric_order = ["duration_s", "board_dwell_pct", "screen_dwell_pct", "entropy"]
+            metrics_present = [m for m in metric_order if m in ldf["metric_key"].values]
+            if metrics_present:
+                titles = {
+                    "duration_s":       "Task Duration (s)",
+                    "board_dwell_pct":  "Board Dwell %",
+                    "screen_dwell_pct": "Screen Dwell %",
+                    "entropy":          "Gaze Entropy (bits)",
+                }
+                n_m = len(metrics_present)
+                rows_n = (n_m + 1) // 2
+                fig = make_subplots(
+                    rows=rows_n, cols=2,
+                    subplot_titles=[titles[m] for m in metrics_present],
+                )
+                shown_legend: set = set()
+                for idx, mkey in enumerate(metrics_present):
+                    r_pos = idx // 2 + 1
+                    c_pos = idx % 2 + 1
+                    mdf = ldf[ldf["metric_key"] == mkey]
+                    for cond, col, fill in [
+                        (cond_a, col_a, fill_a),
+                        (cond_b, col_b, fill_b),
+                    ]:
+                        cdf = mdf[mdf["condition"] == cond].sort_values("task_idx")
+                        if cdf.empty:
+                            continue
+                        show_leg = cond not in shown_legend
+                        if show_leg:
+                            shown_legend.add(cond)
+                        x   = cdf["task_idx"].tolist()
+                        y   = cdf["mean"].tolist()
+                        std = cdf["std"].tolist()
+                        # Shaded ±1 SD band
+                        fig.add_trace(go.Scatter(
+                            x=x + x[::-1],
+                            y=[m + s for m, s in zip(y, std)] +
+                              [m - s for m, s in zip(y[::-1], std[::-1])],
+                            fill="toself", fillcolor=fill,
+                            line=dict(color="rgba(0,0,0,0)"),
+                            showlegend=False, hoverinfo="skip",
+                        ), row=r_pos, col=c_pos)
+                        # Mean line
+                        fig.add_trace(go.Scatter(
+                            x=x, y=y,
+                            mode="lines+markers",
+                            line=dict(width=2, color=col),
+                            marker=dict(size=6),
+                            name=cond, showlegend=show_leg,
+                            customdata=cdf["n"].tolist(),
+                            hovertemplate=(
+                                f"Rep %{{x}}<br>Mean: %{{y:.3f}}"
+                                f"<br>n=%{{customdata}}<extra>{cond}</extra>"
+                            ),
+                        ), row=r_pos, col=c_pos)
+                fig.update_xaxes(title_text="Repetition", dtick=1)
+                fig.update_layout(
+                    title="Learning Curves — Metric Evolution over Task Repetitions",
+                    template="aoi_studio",
+                    height=300 * rows_n,
+                    margin=dict(t=65, b=40),
+                    legend=dict(orientation="h", y=1.04),
+                )
+                result.append(("06_learning_curves", fig))
+
+        return result
+
+    # ── Per-tab HTML helpers ──────────────────────────────────────────────────
+
+    @staticmethod
+    def _fig_to_html(fig) -> str:
+        chart_html = fig.to_html(
+            full_html=False, include_plotlyjs="cdn",
+            config={"responsive": True}, default_height="100%",
+        )
+        return (
+            "<!DOCTYPE html><html><head><meta charset='utf-8'>"
+            "<style>html,body{height:100%;background:#0e0f11;margin:0;padding:8px;"
+            "box-sizing:border-box}.plotly-graph-div{height:100% !important;"
+            "width:100% !important}</style></head>"
+            f"<body>{chart_html}</body></html>"
+        )
+
+    def _stats_page_html(self, report) -> str:
+        return (
+            "<!DOCTYPE html><html><head><meta charset='utf-8'>"
+            "<style>body{background:#0e0f11;color:#e7e8ea;"
+            "font-family:'Hanken Grotesk',sans-serif;margin:0;padding:16px}"
+            "td,th{padding:5px 14px 5px 0}"
+            "td{text-align:right} td:first-child,td:nth-child(2){text-align:left}"
+            "th{text-align:right} th:first-child,th:nth-child(2){text-align:left}"
+            "</style></head>"
+            f"<body>{self._stats_table_html(report)}</body></html>"
+        )
+
+    def _stats_table_html(self, report) -> str:
+        cond_a, cond_b = report.condition_a, report.condition_b
+
+        def _fmt_p(p) -> str:
+            try:
+                pf = float(p)
+            except (TypeError, ValueError):
+                return "—"
+            if math.isnan(pf):
+                return "—"
+            if pf < 0.001: return "<b style='color:#cf6b6b'>&lt;0.001</b>"
+            if pf < 0.01:  return f"<b style='color:#d4a24a'>{pf:.3f}</b>"
+            if pf < 0.05:  return f"<b style='color:#d4a24a'>{pf:.3f}</b>"
+            return f"{pf:.3f}"
+
+        def _fmt_eff(e) -> str:
+            try:
+                ef = float(e)
+            except (TypeError, ValueError):
+                return "—"
+            return "—" if math.isnan(ef) else f"{ef:.3f}"
+
+        rows_html = ""
+        for df, section in [
+            (report.aoi_stats,    "Per-AOI Metrics"),
+            (report.overall_stats, "Overall Metrics"),
+        ]:
+            if df is None or df.empty:
+                continue
+            rows_html += (
+                f"<tr><td colspan='6' style='color:#6a6d73;font-size:12px;"
+                f"padding-top:16px;padding-bottom:4px;"
+                f"border-bottom:1px solid rgba(255,255,255,.07)'>{section}</td></tr>"
+            )
+            for _, row in df.iterrows():
+                aoi_cell = (
+                    f"<td style='color:#9b9ea4'>{row['aoi']}</td>"
+                    if "aoi" in row.index else "<td></td>"
+                )
+                rows_html += (
+                    "<tr>"
+                    + aoi_cell
+                    + f"<td>{row['metric']}</td>"
+                    + f"<td>{float(row[f'{cond_a}_mean']):.3f}"
+                    + f" <span style='color:#62656b'>±{float(row[f'{cond_a}_std']):.3f}</span></td>"
+                    + f"<td>{float(row[f'{cond_b}_mean']):.3f}"
+                    + f" <span style='color:#62656b'>±{float(row[f'{cond_b}_std']):.3f}</span></td>"
+                    + f"<td>{_fmt_p(row['p_value'])}</td>"
+                    + f"<td>{_fmt_eff(row['effect_size'])}</td>"
+                    + "</tr>"
+                )
+
+        return (
+            "<h4 style='color:#9b9ea4;margin:28px 0 8px;font-weight:500'>Statistical Summary"
+            " &nbsp;<span style='font-weight:400;font-size:12px;color:#6a6d73'>"
+            "Mann-Whitney U · effect size = rank-biserial r · * p&lt;0.05</span></h4>"
+            "<table style='border-collapse:collapse;font-size:13px;width:100%;font-family:\"IBM Plex Mono\",monospace'>"
+            f"<tr style='border-bottom:1px solid rgba(255,255,255,.07);color:#62656b'>"
+            "<th>AOI</th><th>Metric</th>"
+            f"<th>{cond_a} (mean±SD)</th>"
+            f"<th>{cond_b} (mean±SD)</th>"
+            "<th>p-value</th><th>Effect size</th>"
+            "</tr>"
+            + rows_html
+            + "</table>"
+        )
+
+    # ── Export PNGs ───────────────────────────────────────────────────────────
+
+    def _export_png(self) -> None:
+        if self._last_report is None:
+            self._status.setText("Run comparison first.")
+            return
+        cond_a: Optional[pathlib.Path] = self._cond_a_combo.currentData()
+        if cond_a is None:
+            return
+        out_dir = cond_a.parent / "aoi_comparison"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        self._status.setText("Rendering PNGs…")
+        QApplication.processEvents()
+        figs = self._build_figures(self._last_report)
+        saved: list[pathlib.Path] = []
+        for slug, fig in figs:
+            path = out_dir / f"{slug}.png"
+            try:
+                h = fig.layout.height or 500
+                fig.write_image(str(path), width=1400, height=h, scale=2)
+                saved.append(path)
+            except Exception as exc:
+                self._status.setText(f"PNG render failed: {exc}")
+                return
+        self._status.setText(f"Saved {len(saved)} PNG(s) → {out_dir}")
+        QMessageBox.information(
+            self, APP_TITLE,
+            f"Saved {len(saved)} chart(s) to:\n{out_dir}\n\n"
+            + "\n".join(p.name for p in saved),
+        )
+
+
+# ─── Export / review helpers ──────────────────────────────────────────────────
+
+def _gap_fill_review(
+    labels: list[str],
+    sources: list[str],
+    max_gap: int = GAP_FILL_MAX_FRAMES,
+) -> tuple[list[str], list[str]]:
+    """Fill short auto-labelled gaps between matching manual corrections."""
+    out_labels = list(labels)
+    out_sources = list(sources)
+    n = len(out_labels)
+    manual_idx = [i for i in range(n) if out_sources[i] == "manual"]
+    for mi in range(len(manual_idx) - 1):
+        i = manual_idx[mi]
+        j = manual_idx[mi + 1]
+        if out_labels[i] != out_labels[j] or j - i <= 1:
+            continue
+        if j - i - 1 > max_gap:
+            continue
+        for k in range(i + 1, j):
+            if out_sources[k] == "auto":
+                out_labels[k] = out_labels[i]
+                out_sources[k] = "auto_gap_fill"
+    return out_labels, out_sources
+
+
+def _export_reviewed_csv(
+    raw_df: pd.DataFrame,
+    edit_labels: list[str],
+    edit_sources: list[str],
+) -> pd.DataFrame:
+    """Merge auto analysis with manual review labels for final export."""
+    df = raw_df.copy()
+    filled_labels, filled_sources = _gap_fill_review(edit_labels, edit_sources)
+    n_video = len(filled_labels)
+
+    if "frame_idx" in df.columns:
+        fi = pd.to_numeric(df["frame_idx"], errors="coerce").fillna(-1).astype(int)
+    else:
+        fi = pd.Series(np.arange(len(df)), index=df.index)
+
+    final_aoi: list[str] = []
+    edit_src: list[str] = []
+    for row_i, idx in enumerate(fi):
+        if 0 <= int(idx) < n_video:
+            final_aoi.append(filled_labels[int(idx)])
+            edit_src.append(filled_sources[int(idx)])
+        else:
+            primary = (
+                str(df["primary_aoi"].iloc[row_i])
+                if "primary_aoi" in df.columns
+                else NONE_LABEL
+            )
+            final_aoi.append(primary)
+            edit_src.append("auto")
+
+    df["final_primary_aoi"] = final_aoi
+    df["edit_source"] = edit_src
+    return df
+
+
+# ─── Main window ──────────────────────────────────────────────────────────────
+
+class CollapsibleBox(QWidget):
+    """A collapsible container widget."""
+    def __init__(self, title="", parent=None):
+        super().__init__(parent)
+        self.toggle_button = QPushButton(title)
+        self.toggle_button.setStyleSheet(f"""
+            QPushButton {{
+                text-align: left;
+                padding: 6px;
+                background-color: {Theme.BG_FIELD};
+                border: none;
+                border-radius: 4px;
+                color: {Theme.TEXT_FAINT};
+                font-size: 11px;
+                font-weight: 500;
+                letter-spacing: 1.1px;
+            }}
+            QPushButton:hover {{
+                background-color: {Theme.BG_CARD};
+                color: {Theme.TEXT};
+            }}
+        """)
+        self.toggle_button.setCheckable(True)
+        self.toggle_button.setChecked(False)  # False = open, True = closed? Wait, let's just make it a toggle
+        
+        # We will use text to show state: ▼ Title / ▶ Title
+        self._title = title
+        self.toggle_button.setText(f"▼  {self._title}")
+        self.toggle_button.clicked.connect(self.on_pressed)
+
+        self.content_area = QWidget()
+        self.content_layout = QVBoxLayout(self.content_area)
+        self.content_layout.setContentsMargins(0, 8, 0, 8)
+        self.content_layout.setSpacing(10)
+
+        main_layout = QVBoxLayout(self)
+        main_layout.setSpacing(0)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.addWidget(self.toggle_button)
+        main_layout.addWidget(self.content_area)
+
+    def on_pressed(self):
+        is_collapsed = self.content_area.isHidden()
+        self.content_area.setVisible(not is_collapsed)
+        indicator = "▼" if is_collapsed else "▶"
+        self.toggle_button.setText(f"{indicator}  {self._title}")
+        
+    def addWidget(self, widget, stretch=0):
+        self.content_layout.addWidget(widget, stretch)
+
+
+class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle(APP_TITLE)
-        if APP_ICON.exists():
-            self.setWindowIcon(QIcon(str(APP_ICON)))
+        icon_path = resolve_app_icon()
+        if icon_path and icon_path.exists():
+            self.setWindowIcon(QIcon(str(icon_path)))
         self.resize(1440, 900)
 
-        self.recording_dir: pathlib.Path | None = None
-        self.df: pd.DataFrame | None = None
-        self.video_path: pathlib.Path | None = None
-        self.cap: cv2.VideoCapture | None = None
-        self.fps = 30.0
-        self.frame_count = 0
-        self.current_frame = 0
-        self.aoi_names: list[str] = list(AOI_NAMES)
-        self.raw_labels: list[str] = []
-        self.edited_labels: list[str] = []
-        self.tasks_data: dict[str, dict[str, int | None]] = {f"Task {i}": {"start": None, "end": None} for i in range(1, 11)}
-        self.edit_source: list[str] = []
-        self.undo_stack: list[tuple[list[str], list[str], int]] = []
-        self.playing = False
-        self.play_until_frame: int | None = None
-        self.analysis_worker_running = False
-        self.watcher_process: subprocess.Popen | None = None
-        self.signals = WorkerSignals()
-
-        self.play_timer = QTimer(self)
-        self.play_timer.timeout.connect(self._play_tick)
-        self.autosave_timer = QTimer(self)
-        self.autosave_timer.setSingleShot(True)
-        self.autosave_timer.timeout.connect(self._autosave_review)
-        self.preanalysis_timer = QTimer(self)
-        self.preanalysis_timer.timeout.connect(self._poll_preanalysis_status)
-
-        self.signals.status.connect(self._set_status)
-        self.signals.loaded.connect(self._load_review)
-        self.signals.exported.connect(self._export_done)
-        self.signals.failed.connect(self._show_error)
-        self.signals.analysis_finished.connect(self._analysis_worker_finished)
-
-        self._build_ui()
-        self._load_settings()
-        self._wire_shortcuts()
-        self._refresh_recordings()
-        self._apply_style()
-        self.preanalysis_timer.start(1000)
-        self._start_watcher()
-
-    def _build_ui(self) -> None:
-        self.tabs = QTabWidget()
-        self.setCentralWidget(self.tabs)
+        self._rec_dir: pathlib.Path | None = None
+        self._df: pd.DataFrame | None = None
+        self._video_path: pathlib.Path | None = None
+        self._fps = 30.0
+        self._n_frames = 0
+        self._current_frame = 0
+        self._edit_labels: list[str] = []
+        self._edit_sources: list[str] = []
+        self._undo_stack: list[tuple[list[str], list[str], int]] = []
+        self._analysis_worker: Worker | None = None
         
-        # TAB 1: REVIEW STUDIO
-        self.review_tab = QWidget()
-        root = QHBoxLayout(self.review_tab)
-        root.setContentsMargins(12, 12, 12, 12)
-        splitter = QSplitter(Qt.Horizontal)
-        root.addWidget(splitter)
-        self.tabs.addTab(self.review_tab, tr("review_studio"))
+        # State variables for new logic
+        self._trim: dict[str, Any] = {}
+        self._tasks: dict[str, Any] = {}
+        self._tabs = QTabWidget()
+        self.setCentralWidget(self._tabs)
 
-        # TAB 2: ANALYTICS DASHBOARD
-        self.dashboard_tab = QWidget()
-        dash_layout = QVBoxLayout(self.dashboard_tab)
-        dash_layout.setContentsMargins(20, 20, 20, 20)
-        
-        dash_header = QHBoxLayout()
-        self.dash_title = QLabel(tr("dashboard"))
-        self.dash_title.setObjectName("panelTitle")
-        self.refresh_dash_btn = QPushButton("Generate Dashboard")
-        self.refresh_dash_btn.setObjectName("primaryButton")
-        self.refresh_dash_btn.clicked.connect(self._render_dashboard)
-        
-        dash_header.addWidget(self.dash_title)
-        dash_header.addStretch(1)
-        dash_header.addWidget(self.refresh_dash_btn)
-        dash_layout.addLayout(dash_header)
-        
-        self.web_view = QWebEngineView()
-        dash_layout.addWidget(self.web_view, 1)
-        self.tabs.addTab(self.dashboard_tab, tr("dashboard"))
+        help_btn = QPushButton("?")
+        help_btn.setObjectName("iconButton")
+        help_btn.setFixedSize(26, 26)
+        help_btn.setToolTip("Keyboard shortcuts")
+        help_btn.clicked.connect(self._show_shortcuts_help)
+        self._tabs.setCornerWidget(help_btn, Qt.TopRightCorner)
 
+        # ── Studio tab ──────────────────────────────────────────────────────
+        studio = QWidget()
+        studio_layout = QHBoxLayout(studio)
+        studio_layout.setContentsMargins(10, 10, 10, 10)
+        studio_layout.setSpacing(12)
+        self._tabs.addTab(studio, "  Studio  ")
+
+        # Left panel — minimum width only; the user drags the splitter to widen
+        # it (e.g. when 5-digit frame numbers crowd the task rows).
         left = QFrame()
-        left.setObjectName("sidePanel")
+        left.setObjectName("leftPanel")
+        left.setMinimumWidth(280)
         left_layout = QVBoxLayout(left)
-        left_layout.setContentsMargins(14, 14, 14, 14)
-        left_layout.setSpacing(10)
+        left_layout.setContentsMargins(16, 18, 16, 18)
+        left_layout.setSpacing(12)
 
-        title = QLabel(tr("review_queue"))
-        title.setObjectName("panelTitle")
-        left_layout.addWidget(title)
+        # ── Source folder ──
+        src_title = QLabel("SOURCE")
+        src_title.setObjectName("sectionTitle")
+        left_layout.addWidget(src_title)
 
-        source_label = QLabel(tr("source_folder"))
-        source_label.setObjectName("fieldLabel")
-        left_layout.addWidget(source_label)
-        
-        source_row = QHBoxLayout()
-        self.source_combo = QComboBox()
-        self.choose_source_button = QPushButton(tr("choose"))
-        source_row.addWidget(self.source_combo, 1)
-        source_row.addWidget(self.choose_source_button)
-        left_layout.addLayout(source_row)
+        src_row = QHBoxLayout()
+        src_row.setSpacing(4)
+        self._src_combo = QComboBox()
+        self._src_combo.setToolTip("Condition or difficulty folder (e.g. NonGamified)")
+        browse_src = QPushButton("…")
+        browse_src.setFixedWidth(26)
+        browse_src.setObjectName("iconButton")
+        browse_src.setToolTip("Browse for source folder")
+        src_row.addWidget(self._src_combo, 1)
+        src_row.addWidget(browse_src)
+        left_layout.addLayout(src_row)
 
-        recording_label = QLabel(tr("recording_folder"))
-        recording_label.setObjectName("fieldLabel")
-        left_layout.addWidget(recording_label)
-        
-        recording_row = QHBoxLayout()
-        self.recording_combo = QComboBox()
-        self.choose_button = QPushButton(tr("choose"))
-        self.refresh_button = QPushButton(tr("refresh"))
-        recording_row.addWidget(self.recording_combo, 1)
-        recording_row.addWidget(self.choose_button)
-        recording_row.addWidget(self.refresh_button)
-        left_layout.addLayout(recording_row)
+        rec_row = QHBoxLayout()
+        rec_row.setSpacing(4)
+        self._rec_combo = QComboBox()
+        self._rec_combo.setToolTip("Recording folder")
+        browse_rec = QPushButton("…")
+        browse_rec.setFixedWidth(26)
+        browse_rec.setObjectName("iconButton")
+        browse_rec.setToolTip("Browse for recording folder directly")
+        refresh_btn = QPushButton()
+        refresh_btn.setIcon(_svg_icon("refresh.svg"))
+        refresh_btn.setIconSize(QSize(14, 14))
+        refresh_btn.setFixedWidth(26)
+        refresh_btn.setObjectName("iconButton")
+        refresh_btn.setToolTip("Refresh list")
+        rec_row.addWidget(self._rec_combo, 1)
+        rec_row.addWidget(browse_rec)
+        rec_row.addWidget(refresh_btn)
+        left_layout.addLayout(rec_row)
 
-        self.force_checkbox = QCheckBox(tr("rerun"))
-        left_layout.addWidget(self.force_checkbox)
+        self._load_btn = QPushButton("Load Recording")
+        self._load_btn.setObjectName("primaryButton")
+        left_layout.addWidget(self._load_btn)
 
-        self.load_button = QPushButton(tr("run_load"))
-        self.load_button.setObjectName("primaryButton")
-        left_layout.addWidget(self.load_button)
+        self._analyze_btn = QPushButton("  Analyse")
+        self._analyze_btn.setIcon(_svg_icon("playbutton.svg"))
+        self._analyze_btn.setIconSize(QSize(14, 14))
+        self._analyze_btn.setObjectName("primaryButton")
+        self._analyze_btn.setEnabled(False)
+        left_layout.addWidget(self._analyze_btn)
 
-        self.preanalysis_progress = QProgressBar()
-        self.preanalysis_progress.setRange(0, 100)
-        self.preanalysis_progress.setValue(0)
-        self.preanalysis_progress.setTextVisible(True)
-        self.preanalysis_progress.hide()
-        left_layout.addWidget(self.preanalysis_progress)
+        self._batch_analyze_btn = QPushButton("  Batch Re-analyse All")
+        self._batch_analyze_btn.setIcon(_svg_icon("playbutton.svg"))
+        self._batch_analyze_btn.setIconSize(QSize(14, 14))
+        self._batch_analyze_btn.setToolTip("Re-run analysis on all recordings in current condition (generates new output files)")
+        self._batch_analyze_btn.setEnabled(True)
+        left_layout.addWidget(self._batch_analyze_btn)
 
-        filter_label = QLabel(tr("category"))
-        filter_label.setObjectName("fieldLabel")
-        left_layout.addWidget(filter_label)
-        self.category_filter = QComboBox()
-        self.category_filter.addItems(["All"] + AOI_NAMES)
-        self.category_filter.setCurrentText(NONE_LABEL)
-        left_layout.addWidget(self.category_filter)
+        self._progress_bar = QProgressBar()
+        self._progress_bar.setRange(0, 100)
+        self._progress_bar.setValue(0)
+        self._progress_bar.setTextVisible(True)
+        self._progress_bar.hide()
+        left_layout.addWidget(self._progress_bar)
 
-        self.segment_table = QTableWidget(0, 4)
-        self.segment_table.setHorizontalHeaderLabels(["Play", "AOI", "Start", "End"])
-        self.segment_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        self.segment_table.verticalHeader().setVisible(False)
-        self.segment_table.setSelectionBehavior(QTableWidget.SelectRows)
-        self.segment_table.setEditTriggers(QTableWidget.NoEditTriggers)
-        left_layout.addWidget(self.segment_table, 1)
+        self._status_lbl = QLabel("No recording loaded.")
+        self._status_lbl.setObjectName("statusLabel")
+        self._status_lbl.setWordWrap(True)
+        left_layout.addWidget(self._status_lbl)
 
-        range_label = QLabel(tr("edit_range"))
-        range_label.setObjectName("fieldLabel")
-        left_layout.addWidget(range_label)
-        range_row = QHBoxLayout()
-        range_row.addWidget(QLabel(tr("start")))
-        self.start_minus_button = QPushButton("-")
-        self.start_minus_button.setFixedWidth(28)
-        self.start_minus_button.setObjectName("iconButton")
-        self.edit_start_spin = QSpinBox()
-        self.edit_start_spin.setRange(0, 0)
-        self.edit_start_spin.setSingleStep(1)
-        self.edit_start_spin.setAccelerated(True)
-        self.edit_start_spin.setMinimumWidth(86)
-        self.edit_start_spin.setKeyboardTracking(False)
-        self.edit_start_spin.setButtonSymbols(QSpinBox.NoButtons)
-        self.start_plus_button = QPushButton("+")
-        self.start_plus_button.setFixedWidth(28)
-        self.start_plus_button.setObjectName("iconButton")
-        range_row.addWidget(self.start_minus_button)
-        range_row.addWidget(self.edit_start_spin)
-        range_row.addWidget(self.start_plus_button)
-        range_row.addWidget(QLabel(tr("end")))
-        self.end_minus_button = QPushButton("-")
-        self.end_minus_button.setFixedWidth(28)
-        self.end_minus_button.setObjectName("iconButton")
-        self.edit_end_spin = QSpinBox()
-        self.edit_end_spin.setRange(0, 0)
-        self.edit_end_spin.setSingleStep(1)
-        self.edit_end_spin.setAccelerated(True)
-        self.edit_end_spin.setMinimumWidth(86)
-        self.edit_end_spin.setKeyboardTracking(False)
-        self.edit_end_spin.setButtonSymbols(QSpinBox.NoButtons)
-        self.end_plus_button = QPushButton("+")
-        self.end_plus_button.setFixedWidth(28)
-        self.end_plus_button.setObjectName("iconButton")
-        range_row.addWidget(self.end_minus_button)
-        range_row.addWidget(self.edit_end_spin)
-        range_row.addWidget(self.end_plus_button)
-        left_layout.addLayout(range_row)
-
-        edit_row = QHBoxLayout()
-        self.edit_to_combo = QComboBox()
-        self.edit_to_combo.addItems(AOI_NAMES)
-        self.edit_to_combo.setCurrentText("Board")
-        self.edit_button = QPushButton(tr("apply"))
-        edit_row.addWidget(self.edit_to_combo)
-        edit_row.addWidget(self.edit_button)
-        left_layout.addLayout(edit_row)
-
-        undo_save_row = QHBoxLayout()
-        self.undo_button = QPushButton(tr("undo"))
-        self.save_draft_button = QPushButton(tr("save_draft"))
-        self.save_button = QPushButton(tr("save_final"))
-        self.save_button.setObjectName("primaryButton")
-        undo_save_row.addWidget(self.undo_button)
-        undo_save_row.addWidget(self.save_draft_button)
-        undo_save_row.addWidget(self.save_button)
-        left_layout.addLayout(undo_save_row)
-
-        task_label = QLabel("Task Segmentation")
-        task_label.setObjectName("fieldLabel")
-        left_layout.addWidget(task_label)
-
-        task_row = QHBoxLayout()
-        self.task_combo = QComboBox()
-        self.task_combo.addItems([f"Task {i}" for i in range(1, 11)])
-        self.task_start_button = QPushButton("Set Start")
-        self.task_end_button = QPushButton("Set End")
-        self.task_clear_button = QPushButton("Clear")
-        task_row.addWidget(self.task_combo, 1)
-        task_row.addWidget(self.task_start_button)
-        task_row.addWidget(self.task_end_button)
-        task_row.addWidget(self.task_clear_button)
-        left_layout.addLayout(task_row)
-
-        self.status_label = QLabel("Select a recording.")
-        self.status_label.setWordWrap(True)
-        self.status_label.setObjectName("statusLabel")
-        left_layout.addWidget(self.status_label)
-
-        right = QFrame()
-        right_layout = QVBoxLayout(right)
-        right_layout.setContentsMargins(12, 0, 0, 0)
-        right_layout.setSpacing(10)
-
-        self.video_label = VideoLabel()
-        right_layout.addWidget(self.video_label, 7)
-
-        controls = QHBoxLayout()
-        self.back_5_button = QPushButton("<< 5s")
-        self.prev_frame_button = QPushButton("< Frame")
-        self.play_button = QPushButton(tr("play"))
-        self.next_frame_button = QPushButton("Frame >")
-        self.forward_5_button = QPushButton("5s >>")
-        self.gap_minus_button = QPushButton("-")
-        self.gap_minus_button.setFixedWidth(28)
-        self.gap_minus_button.setObjectName("iconButton")
-        self.gap_spin = QSpinBox()
-        self.gap_spin.setRange(33, 3000)
-        self.gap_spin.setValue(500)
-        self.gap_spin.setSuffix(" ms")
-        self.gap_spin.setSingleStep(33)
-        self.gap_spin.setKeyboardTracking(False)
-        self.gap_spin.setButtonSymbols(QSpinBox.NoButtons)
-        self.gap_plus_button = QPushButton("+")
-        self.gap_plus_button.setFixedWidth(28)
-        self.gap_plus_button.setObjectName("iconButton")
-        self.auto_fill_button = QPushButton(tr("auto_fill"))
-        self.time_label = QLabel("00:00.000 / 00:00.000")
-        controls.addWidget(self.back_5_button)
-        controls.addWidget(self.prev_frame_button)
-        controls.addWidget(self.play_button)
-        controls.addWidget(self.next_frame_button)
-        controls.addWidget(self.forward_5_button)
-        controls.addSpacing(12)
-        controls.addWidget(QLabel(tr("max_gap")))
-        controls.addWidget(self.gap_minus_button)
-        controls.addWidget(self.gap_spin)
-        controls.addWidget(self.gap_plus_button)
-        controls.addWidget(self.auto_fill_button)
-        controls.addStretch(1)
-        controls.addWidget(self.time_label)
-        right_layout.addLayout(controls)
-
-        self.timeline = TimelineWidget()
-        right_layout.addWidget(self.timeline, 3)
-
-        splitter.addWidget(left)
-        splitter.addWidget(right)
-        splitter.setSizes([420, 980])
-
-        self.source_combo.currentIndexChanged.connect(self._refresh_recordings)
-        self.choose_source_button.clicked.connect(self._choose_source)
-        self.recording_combo.currentIndexChanged.connect(self._poll_preanalysis_status)
-        self.choose_button.clicked.connect(self._choose_recording)
-        self.refresh_button.clicked.connect(self._refresh_recordings)
-        self.load_button.clicked.connect(self._run_or_load)
-        self.category_filter.currentTextChanged.connect(self._refresh_segments)
-        self.segment_table.itemSelectionChanged.connect(self._segment_selection_changed)
-        self.edit_start_spin.valueChanged.connect(self._clamp_edit_range)
-        self.edit_end_spin.valueChanged.connect(self._clamp_edit_range)
-        self.start_minus_button.clicked.connect(lambda: self._nudge_spin(self.edit_start_spin, -1))
-        self.start_plus_button.clicked.connect(lambda: self._nudge_spin(self.edit_start_spin, 1))
-        self.end_minus_button.clicked.connect(lambda: self._nudge_spin(self.edit_end_spin, -1))
-        self.end_plus_button.clicked.connect(lambda: self._nudge_spin(self.edit_end_spin, 1))
-        self.gap_minus_button.clicked.connect(lambda: self._nudge_spin(self.gap_spin, -33))
-        self.gap_plus_button.clicked.connect(lambda: self._nudge_spin(self.gap_spin, 33))
-        self.edit_button.clicked.connect(self._edit_selected_segment)
-        self.undo_button.clicked.connect(self._undo)
-        self.save_draft_button.clicked.connect(self._save_draft)
-        self.save_button.clicked.connect(self._export_final)
-        self.auto_fill_button.clicked.connect(self._auto_fill_short_gaps)
-        self.task_start_button.clicked.connect(self._set_task_start)
-        self.task_end_button.clicked.connect(self._set_task_end)
-        self.task_clear_button.clicked.connect(self._clear_task)
-        self.back_5_button.clicked.connect(lambda: self._jump_seconds(-5))
-        self.forward_5_button.clicked.connect(lambda: self._jump_seconds(5))
-        self.prev_frame_button.clicked.connect(lambda: self._step_frames(-1))
-        self.next_frame_button.clicked.connect(lambda: self._step_frames(1))
-        self.play_button.clicked.connect(self._toggle_play)
-        self.timeline.frameSelected.connect(self._show_frame)
-
-    def _wire_shortcuts(self) -> None:
-        undo_action = QAction(self)
-        undo_action.setShortcut(QKeySequence.Undo)
-        undo_action.triggered.connect(self._undo)
-        self.addAction(undo_action)
-
-    def _apply_style(self) -> None:
-        self.setStyleSheet(
-            """
-            QWidget {
-                color: #E1E4E8;
-                font-family: 'Segoe UI', Inter, Roboto, sans-serif;
-                font-size: 13px;
-                background-color: transparent;
-            }
-            QMainWindow { background: #0D1117; }
-            QTabWidget::pane {
-                border: 1px solid #30363D;
-                background: #0D1117;
-                border-radius: 8px;
-            }
-            QTabBar::tab {
-                background: #161B22;
-                color: #8B949E;
-                padding: 10px 20px;
-                border: 1px solid #30363D;
-                border-bottom: none;
-                border-top-left-radius: 8px;
-                border-top-right-radius: 8px;
-                margin-right: 2px;
-                font-weight: bold;
-            }
-            QTabBar::tab:selected {
-                background: #0D1117;
-                color: #58A6FF;
-                border-bottom: 2px solid #0D1117;
-            }
-            QTabBar::tab:hover:!selected {
-                background: #1F2428;
-                color: #C9D1D9;
-            }
-            QFrame#sidePanel {
-                background: #161B22;
-                border: 1px solid #30363D;
-                border-radius: 12px;
-            }
-            QLabel#panelTitle {
-                color: #E1E4E8;
-                font-size: 20px;
-                font-weight: 700;
-                letter-spacing: 0.5px;
-            }
-            QLabel#fieldLabel {
-                color: #8B949E;
-                font-weight: 600;
-                text-transform: uppercase;
-                font-size: 11px;
-                margin-top: 8px;
-            }
-            QLabel#statusLabel {
-                color: #58A6FF;
-                background: rgba(88, 166, 255, 0.1);
-                border: 1px solid rgba(88, 166, 255, 0.2);
-                border-radius: 8px;
-                padding: 10px;
-                font-weight: 500;
-            }
-            QCheckBox { color: #E1E4E8; spacing: 8px; }
-            QCheckBox::indicator {
-                width: 18px;
-                height: 18px;
-                border-radius: 4px;
-                border: 1px solid #30363D;
-                background: #0D1117;
-            }
-            QCheckBox::indicator:checked {
-                background: #238636;
-                border: 1px solid #2EA043;
-                image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='white' stroke-width='4' stroke-linecap='round' stroke-linejoin='round'><polyline points='20 6 9 17 4 12'></polyline></svg>");
-            }
-            QPushButton {
-                background: #21262D;
-                border: 1px solid #363B42;
-                border-radius: 6px;
-                padding: 8px 14px;
-                color: #C9D1D9;
-                font-weight: 600;
-            }
-            QPushButton:hover { 
-                background: #30363D; 
-                border: 1px solid #8B949E;
-                color: #FFFFFF;
-            }
-            QPushButton:pressed {
-                background: #282E33;
-            }
-            QPushButton#primaryButton {
-                background: #238636;
-                color: #FFFFFF;
-                border: 1px solid #2EA043;
-                font-weight: bold;
-            }
-            QPushButton#primaryButton:hover { 
-                background: #2EA043; 
-                border: 1px solid #3FB950;
-            }
-            QPushButton#iconButton, QTableWidget QPushButton {
-                padding: 0px;
-                font-size: 16px;
-                font-weight: bold;
-            }
-            QComboBox, QSpinBox {
-                background: #0D1117;
-                color: #E1E4E8;
-                border: 1px solid #30363D;
-                border-radius: 6px;
-                padding: 7px 12px;
-                min-height: 22px;
-            }
-            QComboBox:hover, QSpinBox:hover {
-                border: 1px solid #8B949E;
-            }
-            QComboBox:focus, QSpinBox:focus {
-                border: 1px solid #58A6FF;
-                background: #161B22;
-            }
-            QComboBox::drop-down {
-                border: none;
-                width: 30px;
-            }
-            QComboBox::down-arrow {
-                image: none;
-            }
-            QComboBox QAbstractItemView {
-                background: #161B22;
-                color: #E1E4E8;
-                border: 1px solid #30363D;
-                border-radius: 6px;
-                padding: 4px;
-                selection-background-color: #1F6FEB;
-                selection-color: #FFFFFF;
-                outline: none;
-            }
-            QTableWidget {
-                background: #0D1117;
-                color: #E1E4E8;
-                border: 1px solid #30363D;
-                border-radius: 8px;
-                gridline-color: #21262D;
-                selection-background-color: rgba(31, 111, 235, 0.3);
-                selection-color: #FFFFFF;
-            }
-            QTableWidget::item { color: #E1E4E8; padding: 4px; }
-            QHeaderView::section {
-                background: #161B22;
-                color: #8B949E;
-                padding: 8px;
-                border: none;
-                border-bottom: 1px solid #30363D;
-                font-weight: 700;
-                text-transform: uppercase;
-                font-size: 10px;
-            }
-            QProgressBar {
-                background: #0D1117;
-                border: 1px solid #30363D;
-                border-radius: 6px;
-                color: #E1E4E8;
-                text-align: center;
-                font-weight: bold;
-            }
-            QProgressBar::chunk {
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #1F6FEB, stop:1 #58A6FF);
-                border-radius: 5px;
-            }
-            """
+        self._quality_lbl = QLabel("")
+        self._quality_lbl.setWordWrap(True)
+        self._quality_lbl.setStyleSheet(
+            "font-size: 10px; border-radius: 4px; padding: 4px 6px;"
         )
+        self._quality_lbl.hide()
+        left_layout.addWidget(self._quality_lbl)
 
-    def _get_current_source_dir(self) -> pathlib.Path:
-        data = self.source_combo.currentData()
-        if data:
-            return pathlib.Path(data)
-        return pathlib.Path.home()
+        _div1 = QFrame(); _div1.setFrameShape(QFrame.HLine); _div1.setObjectName("divider")
+        left_layout.addWidget(_div1)
 
-    def _load_settings(self) -> None:
-        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-        self.settings_path = CONFIG_DIR / "settings.json"
-        self.app_settings = {"source_folders": []}
-        if self.settings_path.exists():
-            try:
-                self.app_settings = json.loads(self.settings_path.read_text(encoding="utf-8"))
-            except Exception:
-                pass
+        # ── Trim ──
+        self._trim_box = CollapsibleBox("TRIM")
+        self._trim_panel = TrimPanel()
+        self._trim_box.addWidget(self._trim_panel)
+        left_layout.addWidget(self._trim_box)
+
+        # ── AOI Correction ──
+        self._corr_box = CollapsibleBox("AOI CORRECTION")
+        self._correction_panel = CorrectionPanel()
+        self._corr_box.addWidget(self._correction_panel)
+        left_layout.addWidget(self._corr_box)
+
+        # ── Task annotation ──
+        self._task_box = CollapsibleBox("TASKS")
+        self._task_panel = TaskPanel()
+        self._task_box.addWidget(self._task_panel.header_widget)
         
-        folders = self.app_settings.get("source_folders", [])
-        for f in folders:
-            p = pathlib.Path(f)
-            if p.exists():
-                self.source_combo.addItem(p.name, str(p))
+        task_scroll = QScrollArea()
+        task_scroll.setWidgetResizable(True)
+        task_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        task_scroll.setStyleSheet("QScrollArea { border: none; background: transparent; }")
+        task_scroll.setWidget(self._task_panel)
+        self._task_box.addWidget(task_scroll, 1)
 
-    def _save_settings(self) -> None:
-        folders = []
-        for i in range(self.source_combo.count()):
-            folders.append(self.source_combo.itemData(i))
-        self.app_settings["source_folders"] = folders
-        self.settings_path.write_text(json.dumps(self.app_settings, indent=2), encoding="utf-8")
+        self._save_tasks_btn = QPushButton("  Save Tasks")
+        self._save_tasks_btn.setIcon(_svg_icon("export.svg"))
+        self._save_tasks_btn.setIconSize(QSize(14, 14))
+        self._save_tasks_btn.setEnabled(False)
+        self._task_box.addWidget(self._save_tasks_btn)
+        
+        left_layout.addWidget(self._task_box, 1)
+
+        # ── Export ──
+        self._export_box = CollapsibleBox("EXPORT")
+        self._export_btn = QPushButton("  Export Final CSV")
+        self._export_btn.setIcon(_svg_icon("export.svg"))
+        self._export_btn.setIconSize(QSize(14, 14))
+        self._export_box.addWidget(self._export_btn)
+        left_layout.addWidget(self._export_box)
+
+        # Right: video + controls, and timeline — split so the timeline's
+        # height is freely user-resizable by dragging the splitter handle.
+        video_pane = QWidget()
+        video_pane_layout = QVBoxLayout(video_pane)
+        video_pane_layout.setContentsMargins(4, 4, 4, 4)
+        video_pane_layout.setSpacing(10)
+
+        self._video = VideoWidget()
+        video_pane_layout.addWidget(self._video, 1)
+
+        self._playback = PlaybackBar()
+        video_pane_layout.addWidget(self._playback)
+
+        self._timeline = AOITimeline()
+
+        right_splitter = QSplitter(Qt.Vertical)
+        right_splitter.setHandleWidth(6)
+        right_splitter.addWidget(video_pane)
+        right_splitter.addWidget(self._timeline)
+        right_splitter.setStretchFactor(0, 1)
+        right_splitter.setStretchFactor(1, 0)
+        right_splitter.setSizes([600, 110])
+
+        main_splitter = QSplitter(Qt.Horizontal)
+        main_splitter.setHandleWidth(6)
+        main_splitter.addWidget(left)
+        main_splitter.addWidget(right_splitter)
+        main_splitter.setStretchFactor(0, 0)
+        main_splitter.setStretchFactor(1, 1)
+        main_splitter.setSizes([260, 1000])
+        studio_layout.addWidget(main_splitter, 1)
+
+        # ── Dashboard tab ────────────────────────────────────────────────────
+        self._dashboard = DashboardWidget()
+        self._tabs.addTab(self._dashboard, "  Dashboard  ")
+
+        # ── Comparison tab ───────────────────────────────────────────────────
+        self._comparison = ComparisonWidget()
+        self._tabs.addTab(self._comparison, "  Comparison  ")
+
+        # Store button refs for wiring
+        self._browse_src_btn = browse_src
+        self._browse_rec_btn = browse_rec
+        self._refresh_btn    = refresh_btn
+
+    # ── Wire signals ─────────────────────────────────────────────────────────
+
+    def _wire(self) -> None:
+        self._src_combo.currentIndexChanged.connect(self._refresh_recordings)
+        self._browse_src_btn.clicked.connect(self._browse_source)
+        self._browse_rec_btn.clicked.connect(self._browse_recording)
+        self._refresh_btn.clicked.connect(self._refresh_recordings)
+        self._load_btn.clicked.connect(self._load_selected)
+        self._analyze_btn.clicked.connect(self._run_analysis)
+        self._batch_analyze_btn.clicked.connect(self._run_batch_analysis)
+        self._save_tasks_btn.clicked.connect(self._manual_save_tasks)
+        self._export_btn.clicked.connect(self._export_final)
+
+        self._playback.prev_btn.clicked.connect(lambda: self._video.step(-30))
+        self._playback.play_btn.clicked.connect(self._toggle_play)
+        self._playback.next_btn.clicked.connect(lambda: self._video.step(30))
+        self._playback.seeked.connect(self._on_seek)
+
+        self._video.frameChanged.connect(self._on_frame_changed)
+        self._timeline.frameClicked.connect(self._on_seek)
+
+        self._task_panel.tasksChanged.connect(self._on_tasks_changed)
+        self._trim_panel.trimChanged.connect(self._on_trim_changed)
+        self._correction_panel.correctionApplied.connect(self._on_correction_applied)
+
+        # Shortcuts
+        for key, fn in [
+            (Qt.Key_Space, self._toggle_play),
+            (Qt.Key_Left,  lambda: self._video.step(-1)),
+            (Qt.Key_Right, lambda: self._video.step(1)),
+            (Qt.Key_A,     lambda: self._video.step(-1)),
+            (Qt.Key_D,     lambda: self._video.step(1)),
+            (Qt.Key_I,     self._task_panel._on_start),
+            (Qt.Key_O,     self._task_panel._on_end),
+        ]:
+            act = QAction(self)
+            act.setShortcut(key)
+            act.setShortcutContext(Qt.ApplicationShortcut)
+            act.triggered.connect(fn)
+            self.addAction(act)
+
+    # ── Source / recording loading ────────────────────────────────────────────
+
+    def _refresh_sources(self) -> None:
+        self._src_combo.blockSignals(True)
+        self._src_combo.clear()
+        for d in list_source_folders():
+            self._src_combo.addItem(d.name, userData=d)
+        self._src_combo.blockSignals(False)
+        self._refresh_recordings()
+
+    def _get_current_source_dir(self) -> Optional[pathlib.Path]:
+        """Get the currently selected source directory."""
+        return self._src_combo.currentData()
 
     def _refresh_recordings(self) -> None:
-        source_dir = self._get_current_source_dir()
-        if not source_dir.exists():
+        self._rec_combo.clear()
+        src: Optional[pathlib.Path] = self._src_combo.currentData()
+        if src is None or not src.exists():
             return
-        current = self.recording_combo.currentData()
-        self.recording_combo.clear()
-        for path in sorted(source_dir.iterdir()):
-            if path.is_dir() and not path.name.startswith("."):
-                self.recording_combo.addItem(path.name, str(path))
-        if current:
-            idx = self.recording_combo.findData(current)
-            if idx >= 0:
-                self.recording_combo.setCurrentIndex(idx)
-        self._poll_preanalysis_status()
+        for d in sorted(src.iterdir()):
+            if d.is_dir() and (d / "info.json").exists():
+                self._rec_combo.addItem(d.name, userData=d)
 
-    def _choose_source(self) -> None:
-        start_dir = self._get_current_source_dir()
-        chosen = QFileDialog.getExistingDirectory(
-            self,
-            tr("choose"),
-            str(start_dir),
-        )
-        if not chosen:
-            return
-        path = pathlib.Path(chosen)
-        idx = self.source_combo.findData(str(path))
-        if idx < 0:
-            self.source_combo.addItem(path.name, str(path))
-            idx = self.source_combo.count() - 1
-        self.source_combo.setCurrentIndex(idx)
-        self._save_settings()
-        self._set_status(f"Added new source folder: {path.name}.")
+    def _browse_source(self) -> None:
+        path = QFileDialog.getExistingDirectory(self, "Select source folder", str(RECORDINGS_DIR))
+        if path:
+            d = pathlib.Path(path)
+            self._src_combo.addItem(d.name, userData=d)
+            self._src_combo.setCurrentIndex(self._src_combo.count() - 1)
 
-    def _choose_recording(self) -> None:
-        source_dir = self._get_current_source_dir()
-        chosen = QFileDialog.getExistingDirectory(
-            self,
-            "Choose Neon recording folder",
-            str(source_dir),
-        )
-        if not chosen:
-            return
-        path = pathlib.Path(chosen)
-        idx = self.recording_combo.findData(str(path))
-        if idx < 0:
-            self.recording_combo.addItem(path.name, str(path))
-            idx = self.recording_combo.findData(str(path))
-        self.recording_combo.setCurrentIndex(idx)
-        self._set_status(f"Selected {path.name}.")
-        self._poll_preanalysis_status()
-
-    def _selected_recording(self) -> pathlib.Path | None:
-        data = self.recording_combo.currentData()
-        if not data:
-            QMessageBox.warning(self, APP_TITLE, "Select a recording first.")
-            return None
-        path = pathlib.Path(data)
-        if not path.exists():
-            QMessageBox.warning(self, APP_TITLE, f"Recording folder does not exist:\n{path}")
-            return None
-        return path
-
-    def _raw_dir_for(self, rec_dir: pathlib.Path) -> pathlib.Path:
-        return rec_dir / "aoi_results" / "raw"
-
-    def _read_preanalysis_progress(self, raw_dir: pathlib.Path) -> tuple[int, str]:
-        progress_path = raw_dir / "progress.json"
-        if not progress_path.exists():
-            return 0, "starting"
-        try:
-            payload = json.loads(progress_path.read_text(encoding="utf-8"))
-            percent = int(round(float(payload.get("percent", 0))))
-            status = str(payload.get("status", "processing"))
-            return max(0, min(100, percent)), status
-        except Exception:
-            return 0, "processing"
-
-    def _poll_preanalysis_status(self) -> None:
-        data = self.recording_combo.currentData()
-        if not data:
-            return
-        rec_dir = pathlib.Path(data)
-        raw_dir = self._raw_dir_for(rec_dir)
-        processing = (raw_dir / ".processing").exists()
-        if processing or self.analysis_worker_running:
-            percent, status = self._read_preanalysis_progress(raw_dir)
-            self.load_button.setEnabled(True)
-            self.load_button.setText("Force Restart")
-            self.preanalysis_progress.show()
-            self.preanalysis_progress.setValue(percent)
-            self.preanalysis_progress.setFormat(f"Pre-analysis {percent}%")
-            self._set_status(
-                f"Pre-analysis running or stuck. "
-                f"{percent}% complete. Click 'Force Restart' to clear it."
-            )
-            return
-
-        self.load_button.setEnabled(True)
-        self.load_button.setText(tr("run_load"))
-        self.preanalysis_progress.hide()
-
-    def _run_or_load(self) -> None:
-        rec_dir = self._selected_recording()
-        if rec_dir is None:
-            return
-        raw_dir = self._raw_dir_for(rec_dir)
-        if (raw_dir / ".processing").exists():
-            reply = QMessageBox.question(
-                self, 
-                APP_TITLE, 
-                "It looks like analysis is stuck from a previous crash. Do you want to force restart it?",
-                QMessageBox.Yes | QMessageBox.No
-            )
-            if reply == QMessageBox.Yes:
-                try:
-                    (raw_dir / ".processing").unlink(missing_ok=True)
-                except Exception:
-                    pass
-                self.analysis_worker_running = False
+    def _browse_recording(self) -> None:
+        path = QFileDialog.getExistingDirectory(self, "Select recording folder", str(RECORDINGS_DIR))
+        if path:
+            d = pathlib.Path(path)
+            if (d / "info.json").exists():
+                self._rec_combo.addItem(d.name, userData=d)
+                self._rec_combo.setCurrentIndex(self._rec_combo.count() - 1)
+                self._load_recording(d)
             else:
-                return
+                QMessageBox.warning(self, APP_TITLE, "Not a Neon recording (no info.json).")
 
-        self.load_button.setEnabled(False)
-        self.load_button.setText(tr("run_load"))
-        self.preanalysis_progress.show()
-        self.preanalysis_progress.setValue(0)
-        self.preanalysis_progress.setFormat("Pre-analysis 0%")
-        self.analysis_worker_running = True
-        self._set_status("Preparing analysis data...")
-        thread = threading.Thread(
-            target=self._prepare_recording,
-            args=(rec_dir, self.force_checkbox.isChecked()),
-            daemon=True,
-        )
-        thread.start()
+    def _load_selected(self) -> None:
+        rec_dir: Optional[pathlib.Path] = self._rec_combo.currentData()
+        if rec_dir:
+            self._load_recording(rec_dir)
 
-    def _prepare_recording(self, rec_dir: pathlib.Path, force: bool) -> None:
+    def _load_recording(self, rec_dir: pathlib.Path) -> None:
+        self._status_lbl.setText("Loading…")
+        QApplication.processEvents()
         try:
-            raw_dir = self._raw_dir_for(rec_dir)
-            if (raw_dir / ".processing").exists():
-                self.signals.status.emit("Pre-analysis is still running. Please wait.")
-                return
-            analysis_csv = raw_dir / "analysis.csv"
-            validation_video = raw_dir / "validation_video.mp4"
-            if force or not analysis_csv.exists() or not validation_video.exists():
-                self.signals.status.emit("Running marker detection and video overlay...")
-                import analyzer
-
-                analyzer.analyze_recording(rec_dir, raw_dir)
-            self.signals.loaded.emit(rec_dir)
-        except Exception as exc:
-            self.signals.failed.emit(f"{type(exc).__name__}: {exc}")
-        finally:
-            self.signals.analysis_finished.emit()
-
-    def _start_watcher(self) -> None:
-        watcher_path = SRC_DIR / "watcher.py"
-        if self.watcher_process is not None and self.watcher_process.poll() is None:
-            return
-        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-        try:
-            self.watcher_process = subprocess.Popen(
-                [sys.executable, str(watcher_path)],
-                cwd=str(SRC_DIR),
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                creationflags=creationflags,
-            )
-            self._set_status("Background watcher started.")
-        except Exception as exc:
-            self.watcher_process = None
-            self._set_status(f"Could not start background watcher: {type(exc).__name__}: {exc}")
-
-    def _stop_watcher(self) -> None:
-        if self.watcher_process is None or self.watcher_process.poll() is not None:
-            return
-        self.watcher_process.terminate()
-        try:
-            self.watcher_process.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            self.watcher_process.kill()
-            self.watcher_process.wait(timeout=2)
-
-    def _discover_aoi_names(self, df: pd.DataFrame) -> list[str]:
-        discovered: list[str] = []
-        seen: set[str] = set()
-
-        def add_name(value: object) -> None:
-            label = to_ui_label(value)
-            if label in ("All",) or label in HELPER_AOI_LABELS or label in seen:
-                return
-            seen.add(label)
-            discovered.append(label)
-
-        for column in df.columns:
-            if not column.endswith("_hit") or column in HELPER_AOI_COLUMNS:
-                continue
-            add_name(column[:-4])
-
-        if "primary_aoi" in df.columns:
-            for value in df["primary_aoi"].dropna().unique():
-                add_name(value)
-
-        for name in AOI_NAMES:
-            add_name(name)
-
-        if NONE_LABEL in discovered:
-            discovered = [name for name in discovered if name != NONE_LABEL] + [NONE_LABEL]
-        return discovered
-
-    def _sync_aoi_controls(self) -> None:
-        current_filter = self.category_filter.currentText() if hasattr(self, "category_filter") else NONE_LABEL
-        current_edit = self.edit_to_combo.currentText() if hasattr(self, "edit_to_combo") else "Board"
-
-        self.category_filter.blockSignals(True)
-        self.category_filter.clear()
-        self.category_filter.addItems(["All"] + self.aoi_names)
-        self.category_filter.setCurrentText(current_filter if current_filter in ["All"] + self.aoi_names else NONE_LABEL)
-        self.category_filter.blockSignals(False)
-
-        self.edit_to_combo.clear()
-        self.edit_to_combo.addItems(self.aoi_names)
-        self.edit_to_combo.setCurrentText(current_edit if current_edit in self.aoi_names else "Board")
-        self.timeline.set_aoi_names(self.aoi_names)
-
-    def _load_review(self, rec_dir: pathlib.Path) -> None:
-        raw_dir = self._raw_dir_for(rec_dir)
-        if (raw_dir / ".processing").exists():
-            percent, status = self._read_preanalysis_progress(raw_dir)
-            self.load_button.setEnabled(False)
-            self.preanalysis_progress.show()
-            self.preanalysis_progress.setValue(percent)
-            self.preanalysis_progress.setFormat(f"Pre-analysis {percent}%")
-            self._set_status(
-                f"Pre-analysis is still running. Please wait. "
-                f"{percent}% complete ({status})."
-            )
-            return
-        analysis_csv = raw_dir / "analysis.csv"
-        video_path = raw_dir / "validation_video.mp4"
-        if (
-            not analysis_csv.exists()
-            or analysis_csv.stat().st_size == 0
-            or not video_path.exists()
-            or video_path.stat().st_size == 0
-        ):
-            QMessageBox.warning(
-                self,
-                APP_TITLE,
-                "Missing or incomplete analysis.csv / validation_video.mp4. "
-                "If pre-analysis just started, wait until it finishes and try again.",
-            )
-            self._poll_preanalysis_status()
-            return
-
-        self._close_video()
-        self.recording_dir = rec_dir
-        self.df = pd.read_csv(analysis_csv)
-        self.aoi_names = self._discover_aoi_names(self.df)
-        self._sync_aoi_controls()
-        self.raw_labels = self.df["primary_aoi"].map(to_ui_label).tolist()
-        self.edited_labels = list(self.raw_labels)
-        self.edit_source = ["raw"] * len(self.edited_labels)
-        self.undo_stack.clear()
-        self.video_path = video_path
-        self.cap = cv2.VideoCapture(str(video_path))
-        if not self.cap.isOpened():
-            self._close_video()
-            QMessageBox.warning(
-                self,
-                APP_TITLE,
-                "The analysis video is incomplete or cannot be opened yet. "
-                "Wait for pre-analysis to finish, or re-run detection.",
-            )
-            self._poll_preanalysis_status()
-            return
-        self.frame_count = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT)) or len(self.edited_labels)
-        self.fps = float(self.cap.get(cv2.CAP_PROP_FPS)) or 30.0
-        restored = self._restore_autosave_if_available(rec_dir)
-        self.current_frame = restored if restored is not None else 0
-        self._load_tasks(rec_dir)
-        self._show_frame(self.current_frame)
-        self._refresh_segments()
-        self.analysis_worker_running = False
-        self.load_button.setEnabled(True)
-        self.preanalysis_progress.hide()
-        self._set_status(f"Loaded {rec_dir.name}. Focus on reducing None segments.")
-
-    def _restore_autosave_if_available(self, rec_dir: pathlib.Path) -> int | None:
-        state_path = rec_dir / "aoi_results" / "review_state.json"
-        if not state_path.exists():
-            return None
-        try:
-            payload = json.loads(state_path.read_text(encoding="utf-8"))
-            labels = payload.get("edited_labels")
-            sources = payload.get("edit_source")
-            saved_frame = payload.get("current_frame")
-            if isinstance(labels, list) and len(labels) == len(self.edited_labels):
-                self.edited_labels = [to_ui_label(label) for label in labels]
-            if isinstance(sources, list) and len(sources) == len(self.edit_source):
-                self.edit_source = [str(source) for source in sources]
-            self._set_status("Recovered previous autosaved review state.")
-            if isinstance(saved_frame, int): return saved_frame
-            return None
+            import av
+            av.logging.set_level(av.logging.ERROR)
         except Exception:
-            return None
+            pass
+        try:
+            recording = nr.load(str(rec_dir))
+            self._recording = recording
+            self._rec_dir   = rec_dir
+            n = len(recording.scene.time)
+            ts = recording.scene.time
+            raw_fps = max(1.0, (n - 1) / ((ts[-1] - ts[0]) / 1e9)) if n > 1 else 30.0
+            self._fps = min((s for s in (24.0, 25.0, 30.0, 50.0, 60.0) if abs(raw_fps - s) < 4),
+                            key=lambda s: abs(raw_fps - s), default=raw_fps)
 
-    def _close_video(self) -> None:
-        if self.cap is not None:
-            self.cap.release()
-        self.cap = None
+            self._video.load(recording, rec_dir)
+            self._playback.configure(n, self._fps)
+            self._task_panel.set_fps(self._fps)
+            self._set_playing(False)
 
-    def _show_frame(self, frame_idx: int, seek: bool = True) -> None:
-        if self.cap is None:
+            # Reset analysis and task state for the new recording
+            self._csv_labels = []
+            self._edit_labels = []
+            self._edit_sources = []
+            self._correction_panel.reset()
+            self._timeline.set_recording_length(n)
+            self._timeline.set_analysis([], np.array([]), np.array([]), [])
+            self._task_panel.reset()
+            self._tasks = {f"Task {i}": {"start": None, "end": None} for i in range(1, 11)}
+            self._timeline.set_tasks(self._tasks)
+            self._trim_panel.reset()
+            self._trim = self._trim_panel.get_trim()
+
+            # Load existing analysis / tasks / trim / quality if available
+            self._load_analysis_if_ready()
+            self._load_tasks_from_disk()
+            self._load_trim_from_disk()
+            self._load_quality()
+
+            self._analyze_btn.setEnabled(True)
+            self._save_tasks_btn.setEnabled(True)
+            dur = n / self._fps
+            self._status_lbl.setText(
+                f"{rec_dir.name}\n{n} frames  ·  "
+                f"{int(dur//3600)}:{int(dur%3600//60):02d}:{int(dur%60):02d}  ·  "
+                f"{self._fps:.0f} fps"
+            )
+        except Exception as exc:
+            self._status_lbl.setText(f"Load error: {exc}")
+            QMessageBox.warning(self, APP_TITLE, f"Could not load recording:\n{exc}")
+
+    # ── Analysis ──────────────────────────────────────────────────────────────
+
+    def _init_edit_state(self, n_frames: int, df: Optional[pd.DataFrame] = None) -> None:
+        self._edit_labels = list(self._csv_labels) if self._csv_labels else [NONE_LABEL] * n_frames
+        if len(self._edit_labels) < n_frames:
+            self._edit_labels.extend([NONE_LABEL] * (n_frames - len(self._edit_labels)))
+        self._edit_sources = ["auto"] * n_frames
+        if df is None:
             return
-        frame_idx = max(0, min(frame_idx, self.frame_count - 1))
-        if seek or frame_idx != self.current_frame + 1:
-            self.cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-        ok, frame = self.cap.read()
-        if not ok:
+        label_col = "final_primary_aoi" if "final_primary_aoi" in df.columns else None
+        if label_col is None:
             return
-        self.current_frame = frame_idx
-        label = self.edited_labels[frame_idx] if frame_idx < len(self.edited_labels) else NONE_LABEL
-        source = self.edit_source[frame_idx] if frame_idx < len(self.edit_source) else "raw"
-        self._draw_preview_overlay(frame, label, source)
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        h, w = rgb.shape[:2]
-        bytes_per_line = 3 * w
-        image = QImage(rgb.data, w, h, bytes_per_line, QImage.Format_RGB888)
-        pixmap = QPixmap.fromImage(image).scaled(
-            self.video_label.size(),
-            Qt.KeepAspectRatio,
-            Qt.SmoothTransformation,
-        )
-        self.video_label.setPixmap(pixmap)
-        self.timeline.set_data(self.edited_labels, self.current_frame)
-        self.time_label.setText(
-            f"{self._fmt_time(frame_idx / self.fps)} / {self._fmt_time(self.frame_count / self.fps)}"
-        )
+        if "frame_idx" in df.columns:
+            fi = pd.to_numeric(df["frame_idx"], errors="coerce").fillna(-1).astype(int).to_numpy()
+            vals = df[label_col].fillna(NONE_LABEL).astype(str).to_numpy()
+            srcs = (
+                df["edit_source"].astype(str).to_numpy()
+                if "edit_source" in df.columns
+                else np.array(["auto"] * len(df))
+            )
+            for idx, lbl, src in zip(fi, vals, srcs):
+                if 0 <= int(idx) < n_frames:
+                    self._edit_labels[int(idx)] = lbl if lbl else NONE_LABEL
+                    self._edit_sources[int(idx)] = src
 
-    @staticmethod
-    def _draw_preview_overlay(frame: np.ndarray, label: str, source: str) -> None:
-        h, w = frame.shape[:2]
-        color = (84, 97, 110) if label == NONE_LABEL else (25, 118, 110)
-        if source == "manual":
-            color = (37, 99, 235)
-        elif source == "auto_gap_fill":
-            color = (8, 145, 178)
-        cv2.rectangle(frame, (0, h - 46), (w, h), color, -1)
-        text = f"CURRENT AOI: {label.replace('_', ' ')}"
-        if source != "raw":
-            text += f" ({source.replace('_', ' ')})"
-        cv2.putText(
-            frame,
-            text,
-            (14, h - 12),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.68,
-            (255, 255, 255),
-            2,
-            cv2.LINE_AA,
-        )
-
-    def _toggle_play(self) -> None:
-        if self.cap is None:
+    def _on_correction_applied(self, range_mode: bool) -> None:
+        if not self._edit_labels:
             return
-        self.playing = not self.playing
-        if self.playing:
-            self.play_until_frame = None
-        self.play_button.setText("Pause" if self.playing else "Play")
-        if self.playing:
-            self.play_timer.start(max(1, int(1000 / self.fps)))
+        aoi = self._correction_panel.selected_aoi()
+        if range_mode:
+            start, end = self._correction_panel.active_range()
+            if start is None or end is None:
+                return
+            lo, hi = (start, end) if start <= end else (end, start)
+            frames = range(lo, hi + 1)
         else:
-            self.play_timer.stop()
+            frames = [self._video.frame_idx]
+        for f in frames:
+            if 0 <= f < len(self._edit_labels):
+                self._edit_labels[f] = aoi
+                self._edit_sources[f] = "manual"
+        display_labels = list(self._edit_labels)
+        self._timeline.set_analysis(
+            display_labels,
+            self._timeline._gaze_x,
+            self._timeline._gaze_y,
+            self._timeline._fix_frames,
+        )
+        self._status_lbl.setText(f"Corrected {len(frames)} frame(s) → {aoi.replace('_', ' ')}")
 
-    def _play_tick(self) -> None:
-        if self.current_frame >= self.frame_count - 1:
-            self.playing = False
-            self.play_timer.stop()
-            self.play_button.setText("Play")
+    def _on_correction_saved(self) -> None:
+        if not self._rec_dir or not self._edit_labels:
             return
-        if self.play_until_frame is not None and self.current_frame >= self.play_until_frame:
-            self.playing = False
-            self.play_until_frame = None
-            self.play_timer.stop()
-            self.play_button.setText("Play")
+            
+        csv_path = self._rec_dir / "aoi_results" / "raw" / "analysis.csv"
+        if not csv_path.exists():
+            QMessageBox.warning(self, APP_TITLE, "analysis.csv not found.")
             return
-        self._show_frame(self.current_frame + 1, seek=False)
+            
+        try:
+            import pandas as pd
+            df = pd.read_csv(csv_path)
+            
+            # Apply all manual corrections to the DataFrame
+            changes_made = 0
+            for i, (lbl, src) in enumerate(zip(self._edit_labels, self._edit_sources)):
+                if src == "manual" and i < len(df):
+                    df.at[i, "primary_aoi"] = lbl
+                    df.at[i, "aoi_hit_source"] = "manual"
+                    changes_made += 1
+                    
+            if changes_made > 0:
+                # Recalculate transitions
+                df['aoi_transition'] = df['primary_aoi'].ne(df['primary_aoi'].shift()) & df['primary_aoi'].notna()
+                # Ensure NoAOI doesn't count as a transition if coming from NoAOI (pandas shift handles this but just to be sure)
+                
+                df.to_csv(csv_path, index=False)
+                self._status_lbl.setText(f"Saved {changes_made} corrections to analysis.csv")
+                self._correction_panel._save_btn.setText("Saved ✓")
+                QTimer.singleShot(1500, lambda: self._correction_panel._save_btn.setText("Save CSV"))
+            else:
+                self._status_lbl.setText("No manual corrections to save.")
+                
+        except Exception as e:
+            QMessageBox.critical(self, APP_TITLE, f"Failed to save corrections: {e}")
 
-    def _step_frames(self, delta: int) -> None:
-        self.playing = False
-        self.play_until_frame = None
-        self.play_timer.stop()
-        self.play_button.setText("Play")
-        self._show_frame(self.current_frame + delta)
-
-    def _jump_seconds(self, seconds: float) -> None:
-        self._step_frames(int(round(seconds * self.fps)))
-
-    def _play_segment(self, start: int, end: int) -> None:
-        if self.cap is None:
+    def _run_analysis(self) -> None:
+        if self._rec_dir is None:
             return
-        self.playing = True
-        self.play_until_frame = max(start, end)
-        self.play_button.setText("Pause")
-        self._show_frame(start)
-        self.play_timer.start(max(1, int(1000 / self.fps)))
+        if self._analysis_worker is not None and self._analysis_worker.is_alive():
+            reply = QMessageBox.question(self, APP_TITLE,
+                                         "Analysis is running. Force restart?",
+                                         QMessageBox.Yes | QMessageBox.No)
+            if reply != QMessageBox.Yes:
+                return
+            lock = self._rec_dir / "aoi_results" / "raw" / ".processing"
+            lock.unlink(missing_ok=True)
 
-    def _manual_range_edit(self, start: int, end: int, aoi: str) -> None:
-        self._push_undo()
-        self._assign_range(start, end, aoi, "manual")
-        self._after_edit(f"Assigned {aoi} from frame {start} to {end}.")
+        self._analyze_btn.setEnabled(False)
+        self._progress_bar.setValue(0)
+        self._progress_bar.show()
+        self._status_lbl.setText("Analysis running…")
 
-    def _edit_selected_segment(self) -> None:
-        row = self.segment_table.currentRow()
-        if row < 0:
-            QMessageBox.information(self, APP_TITLE, "Select a segment row first.")
+        self._analysis_generation += 1
+        gen = self._analysis_generation
+        worker = AnalysisWorker(
+            self._rec_dir,
+            trim=self._trim_panel.get_trim(),
+            generate_video=False,  # Validation video removed (user request)
+            generation=gen,
+        )
+        worker.signals.status.connect(self._status_lbl.setText)
+        worker.signals.finished.connect(lambda: self._on_analysis_done(gen))
+        worker.signals.failed.connect(lambda msg: self._on_analysis_failed(msg, gen))
+        self._analysis_worker = worker
+        worker.start()
+
+    def _run_batch_analysis(self) -> None:
+        source_dir = self._get_current_source_dir()
+        if source_dir is None:
+            QMessageBox.warning(self, APP_TITLE, "No source folder selected.")
             return
-        start_item = self.segment_table.item(row, 2)
-        end_item = self.segment_table.item(row, 3)
-        if start_item is None or end_item is None:
+
+        recordings = [d for d in source_dir.iterdir() if d.is_dir()]
+        if not recordings:
+            QMessageBox.warning(self, APP_TITLE, f"No recordings found in {source_dir.name}")
             return
-        segment_start = int(start_item.text())
-        segment_end = int(end_item.text())
-        start = self.edit_start_spin.value()
-        end = self.edit_end_spin.value()
-        if start > end:
-            QMessageBox.warning(self, APP_TITLE, "Start frame must be before end frame.")
+
+        reply = QMessageBox.question(
+            self, APP_TITLE,
+            f"Re-analyse all {len(recordings)} recordings in '{source_dir.name}'?\n\n"
+            f"This will regenerate fixation_summary.csv and data_quality.json for all recordings.\n"
+            f"Existing analysis.csv files will be overwritten.",
+            QMessageBox.Yes | QMessageBox.No
+        )
+        if reply != QMessageBox.Yes:
             return
-        if start < segment_start or end > segment_end:
-            QMessageBox.warning(
-                self,
-                APP_TITLE,
-                f"Edit range must stay inside selected segment "
-                f"({segment_start} to {segment_end}).",
-            )
+
+        self._batch_analyze_btn.setEnabled(False)
+        self._status_lbl.setText("Batch analysis starting…")
+
+        self._analysis_generation += 1
+        gen = self._analysis_generation
+        worker = BatchAnalysisWorker(source_dir, generation=gen)
+        worker.signals.status.connect(self._status_lbl.setText)
+        worker.signals.finished.connect(lambda: self._on_batch_analysis_done(gen))
+        worker.signals.failed.connect(lambda msg: self._on_batch_analysis_failed(msg, gen))
+        worker.start()
+
+    def _on_batch_analysis_done(self, generation: int) -> None:
+        if generation != self._analysis_generation:
             return
-        target = self.edit_to_combo.currentText()
-        self._push_undo()
-        self._assign_range(start, end, target, "manual")
-        self._after_edit(f"Changed frames {start} to {end} to {target}.")
+        self._batch_analyze_btn.setEnabled(True)
+        self._status_lbl.setText("Batch analysis complete. All recordings updated.")
+        QMessageBox.information(self, APP_TITLE, "Batch analysis complete!\n\nAll recordings have been re-analysed with new output files.")
 
-    def _segment_selection_changed(self) -> None:
-        row = self.segment_table.currentRow()
-        if row < 0:
+    def _on_batch_analysis_failed(self, msg: str, generation: int) -> None:
+        if generation != self._analysis_generation:
             return
-        start_item = self.segment_table.item(row, 2)
-        end_item = self.segment_table.item(row, 3)
-        aoi_item = self.segment_table.item(row, 1)
-        if start_item is None or end_item is None:
+        self._batch_analyze_btn.setEnabled(True)
+        self._status_lbl.setText("Batch analysis failed.")
+        QMessageBox.warning(self, APP_TITLE, f"Batch analysis failed:\n{msg}")
+
+    def _poll_analysis(self) -> None:
+        if self._rec_dir is None:
             return
-        start = int(start_item.text())
-        end = int(end_item.text())
-        max_frame = max(0, len(self.edited_labels) - 1)
-        self.edit_start_spin.setRange(0, max_frame)
-        self.edit_end_spin.setRange(0, max_frame)
-        self.edit_start_spin.setValue(start)
-        self.edit_end_spin.setValue(end)
-        if aoi_item is not None and aoi_item.text() in self.aoi_names:
-            self.edit_to_combo.setCurrentText(aoi_item.text())
-        self._show_frame(start)
-
-    def _clamp_edit_range(self) -> None:
-        sender = self.sender()
-        start = self.edit_start_spin.value()
-        end = self.edit_end_spin.value()
-        if sender is self.edit_start_spin and start > end:
-            self.edit_end_spin.blockSignals(True)
-            self.edit_end_spin.setValue(start)
-            self.edit_end_spin.blockSignals(False)
-        elif sender is self.edit_end_spin and end < start:
-            self.edit_start_spin.blockSignals(True)
-            self.edit_start_spin.setValue(end)
-            self.edit_start_spin.blockSignals(False)
-
-    def _nudge_spin(self, spin: QSpinBox, delta: int) -> None:
-        next_value = max(spin.minimum(), min(spin.maximum(), spin.value() + delta))
-        spin.setValue(next_value)
-        spin.setFocus(Qt.OtherFocusReason)
-
-    def _assign_range(self, start: int, end: int, aoi: str, source: str) -> None:
-        if not self.edited_labels:
-            return
-        end = min(end, len(self.edited_labels) - 1)
-        start = max(0, start)
-        for idx in range(start, end + 1):
-            self.edited_labels[idx] = aoi
-            self.edit_source[idx] = source
-
-    def _auto_fill_short_gaps(self) -> None:
-        if not self.edited_labels:
-            return
-        self._push_undo()
-        frame_dur_ms = 1000.0 / self.fps if self.fps else 33.333
-        max_gap_frames = max(1, int(round(self.gap_spin.value() / frame_dur_ms)))
-        labels = list(self.edited_labels)
-        filled_frames = 0
-        filled_gaps = 0
-        idx = 0
-        while idx < len(labels):
-            if labels[idx] != NONE_LABEL:
-                idx += 1
-                continue
-            start = idx
-            while idx < len(labels) and labels[idx] == NONE_LABEL:
-                idx += 1
-            end = idx
-            before = labels[start - 1] if start > 0 else None
-            after = labels[end] if end < len(labels) else None
-            if before and before == after and before != NONE_LABEL and (end - start) <= max_gap_frames:
-                self._assign_range(start, end - 1, before, "auto_gap_fill")
-                filled_frames += end - start
-                filled_gaps += 1
-        self._after_edit(f"Auto-filled {filled_frames} frame(s) across {filled_gaps} short AOI gap(s).")
-
-    def _auto_fill_board_gaps(self) -> None:
-        self._auto_fill_short_gaps()
-
-    def _push_undo(self) -> None:
-        self.undo_stack.append((list(self.edited_labels), list(self.edit_source), self.current_frame))
-        if len(self.undo_stack) > 50:
-            self.undo_stack.pop(0)
-
-    def _undo(self) -> None:
-        if not self.undo_stack:
-            self._set_status("Nothing to undo.")
-            return
-        labels, sources, frame = self.undo_stack.pop()
-        self.edited_labels = labels
-        self.edit_source = sources
-        self.current_frame = frame
-        self._after_edit("Undo applied.")
-
-    def _after_edit(self, message: str) -> None:
-        self._show_frame(self.current_frame)
-        self._refresh_segments()
-        self._set_status(message + " Autosave pending.")
-        self.autosave_timer.start(600)
-
-    def _refresh_segments(self) -> None:
-        segments = self._segments()
-        category = self.category_filter.currentText()
-        if category != "All":
-            segments = [segment for segment in segments if segment.aoi == category]
-        self.segment_table.blockSignals(True)
-        self.segment_table.clearContents()
-        self.segment_table.setRowCount(len(segments))
-        for row, segment in enumerate(segments):
-            play_button = QPushButton(tr("play"))
-            play_button.setToolTip("Play this segment from start to end")
-            play_button.clicked.connect(
-                lambda _checked=False, start=segment.start, end=segment.end: self._play_segment(start, end)
-            )
-            self.segment_table.setCellWidget(row, 0, play_button)
-            for col, value in enumerate([segment.aoi, segment.start, segment.end], start=1):
-                item = QTableWidgetItem(str(value))
-                item.setTextAlignment(Qt.AlignCenter)
-                item.setForeground(QBrush(QColor("#102A43")))
-                self.segment_table.setItem(row, col, item)
-        self.segment_table.blockSignals(False)
-        max_frame = max(0, len(self.edited_labels) - 1)
-        self.edit_start_spin.setRange(0, max_frame)
-        self.edit_end_spin.setRange(0, max_frame)
-        self.timeline.set_data(self.edited_labels, self.current_frame)
-
-    def _segments(self) -> list[Segment]:
-        segments: list[Segment] = []
-        if not self.edited_labels:
-            return segments
-        idx = 0
-        while idx < len(self.edited_labels):
-            label = self.edited_labels[idx]
-            start = idx
-            while idx < len(self.edited_labels) and self.edited_labels[idx] == label:
-                idx += 1
-            segments.append(Segment(label, start, idx - 1))
-        return segments
-
-    def _autosave_review(self) -> None:
-        if self.recording_dir is None or self.df is None:
-            return
-        out_dir = self.recording_dir / "aoi_results"
-        state_path = out_dir / "review_state.json"
-        payload = {
-            "edited_labels": self.edited_labels,
-            "edit_source": self.edit_source,
-            "current_frame": self.current_frame,
-        }
-        state_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-        self._set_status(f"Autosaved review state: {state_path.name}")
-
-    def _save_draft(self) -> None:
-        if self.recording_dir is None or self.df is None:
-            QMessageBox.information(self, APP_TITLE, "Load a recording first.")
-            return
-        self._autosave_review()
-        self._set_status("Draft explicitly saved.")
-        QMessageBox.information(self, APP_TITLE, "Progress has been saved. You can safely close the app and resume from this exact frame later.")
-
-    def _save_tasks(self) -> None:
-        rec_dir = self._selected_recording()
-        if not rec_dir: return
-        tasks_file = self._raw_dir_for(rec_dir) / "tasks.json"
-        tasks_file.write_text(json.dumps(self.tasks_data, indent=2), encoding="utf-8")
-
-    def _load_tasks(self, rec_dir: pathlib.Path) -> None:
-        tasks_file = self._raw_dir_for(rec_dir) / "tasks.json"
-        if tasks_file.exists():
+        progress_path = self._rec_dir / "aoi_results" / "raw" / "progress.json"
+        if progress_path.exists():
             try:
-                self.tasks_data = json.loads(tasks_file.read_text(encoding="utf-8"))
+                data = json.loads(progress_path.read_text(encoding="utf-8"))
+                pct  = int(data.get("percent", 0))
+                self._progress_bar.setValue(pct)
+                self._progress_bar.show()
             except Exception:
                 pass
+
+    def _on_analysis_done(self, generation: int) -> None:
+        if generation != self._analysis_generation:
+            return
+        self._analyze_btn.setEnabled(True)
+        self._progress_bar.hide()
+        self._load_analysis_if_ready()
+        self._load_quality()
+        self._status_lbl.setText("Analysis complete.")
+
+    def _on_analysis_failed(self, msg: str, generation: int) -> None:
+        if generation != self._analysis_generation:
+            return
+        self._analyze_btn.setEnabled(True)
+        self._progress_bar.hide()
+        self._status_lbl.setText(f"Analysis failed.")
+        QMessageBox.warning(self, APP_TITLE, f"Analysis failed:\n{msg}")
+
+    def _load_analysis_if_ready(self) -> None:
+        if self._rec_dir is None:
+            return
+        n_frames = self._video.n_frames
+        for csv_path in [
+            self._rec_dir / "aoi_results" / "analysis.csv",
+            self._rec_dir / "aoi_results" / "raw" / "analysis.csv",
+        ]:
+            if csv_path.exists() and csv_path.stat().st_size > 0:
+                try:
+                    df = pd.read_csv(csv_path)
+                    col = "final_primary_aoi" if "final_primary_aoi" in df.columns else "primary_aoi"
+
+                    # CSV rows are positioned by absolute frame_idx (analyzer.py writes
+                    # the position in the *original* video, not the row's position in
+                    # a trimmed CSV) — scatter onto a full-length array by that column
+                    # rather than assuming row order starts at video frame 0. Without
+                    # this, a trimmed analysis would visually appear to sit at the start
+                    # of the timeline instead of at its actual trimmed position.
+                    if "frame_idx" in df.columns:
+                        abs_idx = pd.to_numeric(df["frame_idx"], errors="coerce").fillna(-1).astype(int).to_numpy()
+                    else:
+                        abs_idx = np.arange(len(df))
+
+                    labels = np.full(n_frames, NONE_LABEL, dtype=object)
+                    aoi_vals = df[col].fillna(NONE_LABEL).astype(str).to_numpy()
+                    in_range = (abs_idx >= 0) & (abs_idx < n_frames)
+                    labels[abs_idx[in_range]] = aoi_vals[in_range]
+                    self._csv_labels = labels.tolist()
+
+                    # Extract gaze trace for timeline
+                    gaze_x = np.full(n_frames, np.nan)
+                    gaze_y = np.full(n_frames, np.nan)
+                    if "gaze_x_px" in df.columns and "gaze_y_px" in df.columns:
+                        gx = pd.to_numeric(df["gaze_x_px"], errors="coerce").to_numpy()
+                        gy = pd.to_numeric(df["gaze_y_px"], errors="coerce").to_numpy()
+                        gaze_x[abs_idx[in_range]] = gx[in_range]
+                        gaze_y[abs_idx[in_range]] = gy[in_range]
+
+                    # Fixation frame indices
+                    fix_frames: list[int] = []
+                    if "is_fixation" in df.columns:
+                        fix_mask = pd.to_numeric(df["is_fixation"], errors="coerce").fillna(0) > 0
+                        # Sample every 5th fixation frame to avoid dense overdraw
+                        fix_idx = abs_idx[fix_mask.to_numpy() & in_range]
+                        fix_frames = sorted(int(i) for i in fix_idx)[::5]
+
+                    self._timeline.set_recording_length(n_frames)
+                    self._init_edit_state(n_frames, df)
+                    display_labels = self._edit_labels if self._edit_labels else self._csv_labels
+                    self._timeline.set_analysis(display_labels, gaze_x, gaze_y, fix_frames)
+                    return
+                except Exception:
+                    pass
+
+    def _load_quality(self) -> None:
+        """Read data_quality.json and update the quality indicator label."""
+        if self._rec_dir is None:
+            self._quality_lbl.hide()
+            return
+        for path in [
+            self._rec_dir / "aoi_results" / "raw" / "data_quality.json",
+            self._rec_dir / "aoi_results" / "data_quality.json",
+        ]:
+            if path.exists():
+                try:
+                    dq       = json.loads(path.read_text(encoding="utf-8"))
+                    valid    = 100.0 - float(dq.get("missing_gaze_pct", 0.0))
+                    fix_n    = int(dq.get("fixation_count", 0))
+                    dur_s    = float(dq.get("recording_duration_s", 0.0))
+                    mm       = int(dur_s) // 60
+                    ss       = int(dur_s) % 60
+
+                    # Color coding and warning
+                    if valid >= 80:
+                        color = "#6fae7d"
+                        quality_status = "Good"
+                    elif valid >= 60:
+                        color = "#d4a24a"
+                        quality_status = "Acceptable"
+                        QMessageBox.warning(
+                            self, APP_TITLE,
+                            f"⚠ Data Quality Warning\n\n"
+                            f"Gaze validity: {valid:.1f}% (60-80% range)\n\n"
+                            f"This recording has acceptable but not ideal data quality.\n"
+                            f"Consider noting this in your research write-up.\n\n"
+                            f"Possible causes:\n"
+                            f"• Poor eye tracker calibration\n"
+                            f"• Frequent looking away from scene\n"
+                            f"• Lighting conditions\n"
+                            f"• Excessive head movement"
+                        )
+                    else:
+                        color = "#cf6b6b"
+                        quality_status = "Poor"
+                        QMessageBox.critical(
+                            self, APP_TITLE,
+                            f"❌ Low Data Quality Alert\n\n"
+                            f"Gaze validity: {valid:.1f}% (below 60%)\n\n"
+                            f"This recording has poor data quality and should be flagged.\n"
+                            f"Results may not be reliable for analysis.\n\n"
+                            f"Recommended actions:\n"
+                            f"• Check if the recording can be excluded\n"
+                            f"• Review participant instructions\n"
+                            f"• Verify eye tracker calibration procedure\n"
+                            f"• Consider re-recording if possible"
+                        )
+
+                    self._quality_lbl.setText(
+                        f"Gaze valid: {valid:.1f}%   ·   {fix_n} fixations   ·   {mm}:{ss:02d}   ·   {quality_status}"
+                    )
+                    self._quality_lbl.setStyleSheet(
+                        f"color: {color}; font-size: 12px; font-family: 'IBM Plex Mono', monospace; "
+                        f"background: transparent; border: 1px solid rgba(255,255,255,.08); "
+                        f"border-radius: {Theme.RADIUS}px; padding: 6px 8px;"
+                    )
+                    self._quality_lbl.show()
+                    return
+                except Exception:
+                    pass
+        self._quality_lbl.hide()
+
+    # ── Playback ──────────────────────────────────────────────────────────────
+
+    def _toggle_play(self) -> None:
+        self._set_playing(not self._playing)
+
+    def _set_playing(self, playing: bool) -> None:
+        self._playing = playing
+        self._video.set_playing(playing)
+        self._playback.set_playing(playing)
+        if playing:
+            interval = max(16, int(1000 / (self._fps * self._speed)))
+            self._play_timer.start(interval)
         else:
-            self.tasks_data = {f"Task {i}": {"start": None, "end": None} for i in range(1, 11)}
-        self.timeline.set_tasks(self.tasks_data)
+            self._play_timer.stop()
+            self._video.render()   # re-render with surfaces now that we're paused
 
-    def _set_task_start(self) -> None:
-        if not self.edited_labels: return
-        t = self.task_combo.currentText()
-        self.tasks_data[t]["start"] = self.current_frame
-        self._save_tasks()
-        self.timeline.set_tasks(self.tasks_data)
-        self._set_status(f"Marked {t} start at frame {self.current_frame}")
+    def _play_tick(self) -> None:
+        if not self._video.play_step():
+            self._set_playing(False)
 
-    def _set_task_end(self) -> None:
-        if not self.edited_labels: return
-        t = self.task_combo.currentText()
-        self.tasks_data[t]["end"] = self.current_frame
-        self._save_tasks()
-        self.timeline.set_tasks(self.tasks_data)
-        self._set_status(f"Marked {t} end at frame {self.current_frame}")
+    def _on_seek(self, idx: int) -> None:
+        self._video.seek(idx)
 
-    def _clear_task(self) -> None:
-        if not self.edited_labels: return
-        t = self.task_combo.currentText()
-        self.tasks_data[t]["start"] = None
-        self.tasks_data[t]["end"] = None
-        self._save_tasks()
-        self.timeline.set_tasks(self.tasks_data)
-        self._set_status(f"Cleared {t}")
+    def _on_frame_changed(self, idx: int) -> None:
+        self._playback.set_frame(idx)
+        self._timeline.set_frame(idx)
+        self._task_panel.set_current_frame(idx)
+        self._trim_panel.set_current_frame(idx)
+        self._correction_panel.set_current_frame(idx)
+
+    # ── Tasks ─────────────────────────────────────────────────────────────────
+
+    def _on_tasks_changed(self, tasks: dict) -> None:
+        self._tasks = tasks
+        self._timeline.set_tasks(tasks)
+        self._save_tasks_to_disk()
+
+    def _refresh_timeline(self) -> None:
+        self._timeline.set_tasks(self._tasks)
+        self._timeline.set_frame(self._video.frame_idx)
+
+    def _save_tasks_to_disk(self) -> None:
+        if self._rec_dir is None:
+            return
+        out_dir = self._rec_dir / "aoi_results"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        task_path = out_dir / "tasks.json"
+        task_path.write_text(json.dumps(self._tasks, indent=2), encoding="utf-8")
+
+    def _manual_save_tasks(self) -> None:
+        self._tasks = self._task_panel.get_tasks()
+        self._save_tasks_to_disk()
+        self._save_tasks_btn.setText("  Saved ✓")
+        QTimer.singleShot(1800, lambda: self._save_tasks_btn.setText("  Save Tasks"))
+
+    def _load_tasks_from_disk(self) -> None:
+        if self._rec_dir is None:
+            return
+        for task_path in [
+            self._rec_dir / "aoi_results" / "tasks.json",
+            self._rec_dir / "aoi_results" / "raw" / "tasks.json",
+        ]:
+            if task_path.exists():
+                try:
+                    data = json.loads(task_path.read_text(encoding="utf-8"))
+                    self._task_panel.load_tasks(data)
+                    return
+                except Exception:
+                    pass
+
+    # ── Trim ──────────────────────────────────────────────────────────────────
+
+    def _on_trim_changed(self, start: object, end: object) -> None:
+        self._trim = self._trim_panel.get_trim()
+        if self._rec_dir is None:
+            return
+        out_dir = self._rec_dir / "aoi_results"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        (out_dir / "trim.json").write_text(json.dumps(self._trim, indent=2), encoding="utf-8")
+
+    def _on_crop_data_requested(self) -> None:
+        if self._rec_dir is None:
+            QMessageBox.warning(self, APP_TITLE, "Load a recording first.")
+            return
+            
+        trim = self._trim_panel.get_trim()
+        start = trim.get("start_frame")
+        end = trim.get("end_frame")
+        pad_s = trim.get("padding_s", 0)
+        fps = self._fps if self._fps > 0 else 30.0
+        pad_frames = int(pad_s * fps)
+        
+        start_f = (start - pad_frames) if start is not None else 0
+        end_f = (end + pad_frames) if end is not None else self._n_frames
+        
+        raw_csv = self._rec_dir / "aoi_results" / "raw" / "analysis.csv"
+        raw_fix = self._rec_dir / "aoi_results" / "raw" / "fixation_summary.csv"
+        
+        if not raw_csv.exists():
+            QMessageBox.warning(self, APP_TITLE, "No analysis.csv found to crop.")
+            return
+            
+        # Ask for confirmation
+        res = QMessageBox.question(
+            self, APP_TITLE, 
+            f"This will PERMANENTLY remove data outside frames {max(0, start_f)} - {end_f} from the raw CSVs.\n\n"
+            "This lets you instantly crop the data without re-running the 40-minute analysis.\n\n"
+            "Are you sure you want to crop the data?", 
+            QMessageBox.Yes | QMessageBox.No
+        )
+        if res != QMessageBox.Yes:
+            return
+            
+        try:
+            import pandas as pd
+            df = pd.read_csv(raw_csv)
+            original_len = len(df)
+            df = df[(df['frame_idx'] >= start_f) & (df['frame_idx'] <= end_f)]
+            df.to_csv(raw_csv, index=False)
+            
+            if raw_fix.exists():
+                fdf = pd.read_csv(raw_fix)
+                fdf = fdf[(fdf['end_frame'] >= start_f) & (fdf['start_frame'] <= end_f)]
+                fdf.to_csv(raw_fix, index=False)
+                
+            QMessageBox.information(self, APP_TITLE, f"Successfully cropped data from {original_len} to {len(df)} frames.\n\nPlease click the 'Load' button in the Dashboard tab to refresh the charts!")
+        except Exception as e:
+            QMessageBox.critical(self, APP_TITLE, f"Failed to crop data: {e}")
+
+    def _load_trim_from_disk(self) -> None:
+        if self._rec_dir is None:
+            return
+        for trim_path in [
+            self._rec_dir / "aoi_results" / "trim.json",
+            self._rec_dir / "aoi_results" / "raw" / "trim.json",
+        ]:
+            if trim_path.exists():
+                try:
+                    data = json.loads(trim_path.read_text(encoding="utf-8"))
+                    self._trim_panel.load_trim(data)
+                    return
+                except Exception:
+                    pass
+
+    # ── Export ────────────────────────────────────────────────────────────────
 
     def _export_final(self) -> None:
-        if self.recording_dir is None or self.df is None or self.video_path is None:
-            QMessageBox.information(self, APP_TITLE, "Load a recording before exporting.")
+        if self._rec_dir is None:
+            QMessageBox.information(self, APP_TITLE, "Load a recording first.")
             return
-        self._autosave_review()
-        labels = list(self.edited_labels)
-        sources = list(self.edit_source)
-        df = self.df.copy()
-        rec_dir = self.recording_dir
-        video_path = self.video_path
-        self._set_status("Exporting final CSV and validation video...")
-        thread = threading.Thread(
-            target=self._write_final_outputs,
-            args=(rec_dir, df, labels, sources, video_path),
-            daemon=True,
-        )
-        thread.start()
+        raw_csv = self._rec_dir / "aoi_results" / "raw" / "analysis.csv"
+        if not raw_csv.exists() or raw_csv.stat().st_size == 0:
+            QMessageBox.information(self, APP_TITLE,
+                                    "Run Analysis first to generate the CSV.")
+            return
+        if not self._edit_labels:
+            QMessageBox.information(self, APP_TITLE,
+                                    "Load analysis results before exporting.")
+            return
 
-    def _write_final_outputs(
-        self,
-        rec_dir: pathlib.Path,
-        df: pd.DataFrame,
-        labels: list[str],
-        sources: list[str],
-        video_path: pathlib.Path,
-    ) -> None:
         try:
-            out_dir = rec_dir / "aoi_results"
-            final_csv = out_dir / "analysis.csv"
-            final_video = out_dir / "validation_video.mp4"
-            row_count = min(len(df), len(labels))
-            df = df.iloc[:row_count].copy()
-            df["raw_primary_aoi"] = df["primary_aoi"].map(to_ui_label)
-            df["final_primary_aoi"] = labels[:row_count]
-            df["final_any_aoi_hit"] = df["final_primary_aoi"] != NONE_LABEL
-            df["edit_source"] = sources[:row_count]
-            df.to_csv(final_csv, index=False)
-            self._render_final_video(video_path, final_video, labels, sources)
-            self.signals.exported.emit(out_dir)
+            raw_df = pd.read_csv(raw_csv)
+            out_dir = self._rec_dir / "aoi_results"
+            out_dir.mkdir(parents=True, exist_ok=True)
+
+            df = _export_reviewed_csv(raw_df, self._edit_labels, self._edit_sources)
+            out_csv = out_dir / "analysis.csv"
+            df.to_csv(out_csv, index=False, encoding="utf-8-sig")
+
+            task_path = out_dir / "tasks.json"
+            task_path.write_text(json.dumps(self._tasks, indent=2), encoding="utf-8")
+
+            manual_n = sum(1 for s in self._edit_sources if s == "manual")
+            gap_n = sum(1 for s in df["edit_source"].astype(str) if s == "auto_gap_fill")
+            QMessageBox.information(
+                self, APP_TITLE,
+                f"Exported to:\n{out_csv}\n{task_path}\n\n"
+                f"Manual corrections: {manual_n} frame(s)\n"
+                f"Auto gap-fill: {gap_n} frame(s)",
+            )
         except Exception as exc:
-            self.signals.failed.emit(f"{type(exc).__name__}: {exc}")
+            QMessageBox.warning(self, APP_TITLE, f"Export failed:\n{exc}")
 
-    def _render_final_video(
-        self,
-        source_video: pathlib.Path,
-        output_video: pathlib.Path,
-        labels: list[str],
-        sources: list[str],
-    ) -> None:
-        cap = cv2.VideoCapture(str(source_video))
-        fps = float(cap.get(cv2.CAP_PROP_FPS)) or self.fps or 30.0
-        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        writer = cv2.VideoWriter(
-            str(output_video),
-            cv2.VideoWriter_fourcc(*"mp4v"),
-            fps,
-            (width, height),
-        )
-        idx = 0
+    # ── Help ──────────────────────────────────────────────────────────────────
+
+    def _show_shortcuts_help(self) -> None:
+        QMessageBox.information(self, f"{APP_TITLE} — Keyboard Shortcuts", (
+            "<b>Playback</b><br>"
+            "Space — Play / Pause<br>"
+            "Left / Right Arrow — Step 1 frame<br>"
+            "Prev / Next buttons — Step 1 second (30 frames)<br>"
+            "<br><b>Tasks</b><br>"
+            "I — Mark start of selected task at current frame<br>"
+            "O — Mark end of selected task at current frame<br>"
+            "<br><b>AOI Correction</b><br>"
+            "Choose an AOI, then Set Frame or mark Range In/Out and Apply Range<br>"
+            "<br><b>Trim</b><br>"
+            "Set In / Set Out buttons — Mark the analysis range at the current frame<br>"
+            "Clear — Remove trim, analyse the full recording"
+        ))
+
+    # ── Stylesheet ────────────────────────────────────────────────────────────
+
+    def _apply_style(self) -> None:
+        check_svg = str(CONFIG_DIR / "check.svg").replace("\\", "/")
+        T = Theme
+        self.setStyleSheet(f"""
+QWidget {{
+    color: {T.TEXT};
+    font-family: '{T.FONT_UI}', 'Segoe UI', sans-serif;
+    font-size: 13px;
+    background: transparent;
+}}
+QMainWindow, QDialog {{ background: {T.BG_BASE}; }}
+
+QTabWidget::pane {{
+    border: none;
+    background: {T.BG_BASE};
+}}
+QTabBar {{ background: {T.BG_BASE}; }}
+QTabBar::tab {{
+    background: {T.BG_BASE};
+    color: {T.TEXT_DIM};
+    padding: 14px 16px;
+    margin-right: 10px;
+    border-bottom: 2px solid transparent;
+    font-weight: 500;
+    font-size: 13px;
+}}
+QTabBar::tab:selected {{
+    color: {T.TEXT_BRIGHT};
+    border-bottom: 2px solid {T.ACCENT};
+}}
+QTabBar::tab:hover:!selected {{ color: {T.TEXT_SECONDARY}; }}
+
+QFrame#leftPanel {{
+    background: {T.BG_PANEL};
+    border-right: 1px solid {T.BORDER_SUBTLE};
+}}
+QFrame#divider {{
+    color: {T.BORDER_SUBTLE};
+    background: {T.BORDER_SUBTLE};
+    max-height: 1px;
+    margin: 2px 0;
+}}
+QSplitter::handle {{
+    background: {T.BORDER_SUBTLE};
+}}
+QSplitter::handle:hover {{
+    background: {T.ACCENT};
+}}
+QLabel#sectionTitle {{
+    color: {T.TEXT_FAINT};
+    font-size: 11px;
+    font-weight: 500;
+    letter-spacing: 1.1px;
+    margin-top: 4px;
+}}
+QLabel#statusLabel {{
+    color: {T.TEXT_DIM};
+    font-family: '{T.FONT_MONO}', monospace;
+    font-size: 12px;
+    background: transparent;
+    border: 1px solid {T.BORDER_SUBTLE};
+    border-radius: {T.RADIUS}px;
+    padding: 8px 10px;
+}}
+
+QPushButton {{
+    background: transparent;
+    border: 1px solid {T.BORDER};
+    border-radius: {T.RADIUS}px;
+    padding: 8px 12px;
+    color: {T.TEXT_SECONDARY};
+    font-weight: 500;
+}}
+QPushButton:hover {{
+    border-color: rgba(255,255,255,.22);
+    color: {T.TEXT_BRIGHT};
+}}
+QPushButton:pressed {{ background: rgba(255,255,255,.04); }}
+QPushButton#primaryButton {{
+    background: {T.ACCENT};
+    border-color: {T.ACCENT};
+    color: #ffffff;
+    font-weight: 600;
+}}
+QPushButton#primaryButton:hover {{
+    background: #7e9bdb;
+    border-color: #7e9bdb;
+}}
+QPushButton#primaryButton:pressed {{ background: #5f7dc0; }}
+QPushButton#taskHeaderBtn {{
+    background: {T.BG_FIELD};
+    border: 1px solid {T.BORDER_SUBTLE};
+    border-radius: 6px;
+    padding: 1px 6px;
+    color: {T.TEXT_DIM};
+    font-size: 11px;
+    font-weight: 500;
+}}
+QPushButton#taskHeaderBtn:hover {{ border-color: rgba(255,255,255,.22); color: {T.TEXT_SECONDARY}; }}
+QPushButton#taskHeaderBtn:pressed {{ background: rgba(255,255,255,.04); }}
+QPushButton#taskHeaderBtn:disabled {{ background: transparent; border-color: {T.BORDER_FAINT}; color: {T.TEXT_VFAINT}; }}
+QPushButton#iconButton {{
+    padding: 4px 6px;
+    background: {T.BG_FIELD};
+    border-color: {T.BORDER_SUBTLE};
+}}
+QPushButton#iconButton:hover {{ border-color: rgba(255,255,255,.22); }}
+
+QWidget#taskHeader {{
+    background: {T.BG_FIELD};
+    border-radius: {T.RADIUS}px;
+    border: 1px solid {T.BORDER_SUBTLE};
+}}
+
+QPushButton#collapsibleHeader {{
+    background: transparent;
+    border: none;
+    border-radius: 0;
+    padding: 2px 0;
+    color: {T.TEXT_FAINT};
+    font-size: 11px;
+    font-weight: 500;
+    letter-spacing: 1.1px;
+    text-align: left;
+}}
+QPushButton#collapsibleHeader:hover {{
+    color: {T.TEXT_SECONDARY};
+    background: transparent;
+}}
+
+QComboBox {{
+    background: transparent;
+    border: 1px solid {T.BORDER};
+    border-radius: {T.RADIUS}px;
+    padding: 6px 10px;
+    color: {T.TEXT_SECONDARY};
+}}
+QComboBox:hover {{ border-color: rgba(255,255,255,.2); }}
+QComboBox::drop-down {{ border: none; width: 20px; }}
+QComboBox::down-arrow {{ image: none; }}
+QComboBox QAbstractItemView {{
+    background: {T.BG_FIELD};
+    border: 1px solid {T.BORDER};
+    selection-background-color: {T.ACCENT};
+    color: {T.TEXT_SECONDARY};
+}}
+
+QDoubleSpinBox, QSpinBox {{
+    background: transparent;
+    border: 1px solid {T.BORDER};
+    border-radius: {T.RADIUS}px;
+    padding: 4px 8px;
+    color: {T.TEXT};
+    font-family: '{T.FONT_MONO}', monospace;
+}}
+
+QSlider::groove:horizontal {{
+    background: #1c1f24;
+    height: 4px;
+    border-radius: 2px;
+}}
+QSlider::handle:horizontal {{
+    background: {T.TEXT};
+    width: 14px;
+    height: 14px;
+    margin: -5px 0;
+    border-radius: 7px;
+}}
+QSlider::sub-page:horizontal {{ background: rgba(255,255,255,.35); border-radius: 2px; }}
+
+QProgressBar {{
+    background: {T.BG_FIELD};
+    border: 1px solid {T.BORDER_SUBTLE};
+    border-radius: 4px;
+    height: 8px;
+    text-align: center;
+    font-size: 10px;
+    color: {T.TEXT_FAINT};
+}}
+QProgressBar::chunk {{
+    background: {T.ACCENT};
+    border-radius: 4px;
+}}
+
+QScrollBar:vertical {{
+    background: {T.BG_BASE};
+    width: 9px;
+    border-radius: 4px;
+}}
+QScrollBar::handle:vertical {{ background: rgba(255,255,255,.10); border-radius: 4px; }}
+QScrollBar::handle:vertical:hover {{ background: rgba(255,255,255,.18); }}
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}
+
+QCheckBox {{ color: {T.TEXT_SECONDARY}; spacing: 6px; }}
+QCheckBox::indicator {{
+    width: 14px; height: 14px;
+    border-radius: 3px;
+    border: 1.5px solid {T.BORDER};
+    background: transparent;
+}}
+QCheckBox::indicator:hover {{ border-color: rgba(255,255,255,.3); }}
+QCheckBox::indicator:checked {{
+    background: {T.ACCENT};
+    border-color: {T.ACCENT};
+    image: url({check_svg});
+}}
+""")
+
+
+# ─── Entry point ──────────────────────────────────────────────────────────────
+
+def main() -> None:
+    import sys
+    if sys.platform == "win32":
+        # Without this, Windows groups the taskbar entry under python.exe and
+        # shows the interpreter's icon instead of ours, no matter what
+        # setWindowIcon is called with.
+        import ctypes
         try:
-            while True:
-                ok, frame = cap.read()
-                if not ok:
-                    break
-                label = labels[idx] if idx < len(labels) else NONE_LABEL
-                source = sources[idx] if idx < len(sources) else "raw"
-                self._draw_preview_overlay(frame, label, source)
-                writer.write(frame)
-                idx += 1
-        finally:
-            cap.release()
-            writer.release()
-
-    @staticmethod
-    def _fmt_time(seconds: float) -> str:
-        minutes = int(seconds // 60)
-        rest = seconds - minutes * 60
-        return f"{minutes:02d}:{rest:06.3f}"
-
-    def _set_status(self, message: str) -> None:
-        self.status_label.setText(message)
-
-    def _export_done(self, out_dir: pathlib.Path) -> None:
-        self._set_status(f"Exported final outputs to {out_dir}.")
-        QMessageBox.information(self, APP_TITLE, f"Exported final outputs to:\n{out_dir}")
-
-    def _show_error(self, message: str) -> None:
-        self._set_status("Failed.")
-        self.analysis_worker_running = False
-        self._poll_preanalysis_status()
-        QMessageBox.critical(self, APP_TITLE, message)
-
-    def _analysis_worker_finished(self) -> None:
-        self.analysis_worker_running = False
-        self._poll_preanalysis_status()
-
-    def closeEvent(self, event) -> None:
-        self._close_video()
-        self._stop_watcher()
-        super().closeEvent(event)
-
-
-    def _render_dashboard(self) -> None:
-        if not self.edited_labels:
-            self._set_status("No data to render dashboard.")
-            return
-            
-        self._set_status("Generating Dashboard...")
-        
-        counts = {}
-        for lbl in self.edited_labels:
-            counts[lbl] = counts.get(lbl, 0) + 1
-            
-        for k in counts:
-            counts[k] = counts[k] / self.fps
-            
-        import pandas as pd
-        df_dash = pd.DataFrame({
-            "AOI": list(counts.keys()),
-            "Dwell Time (s)": list(counts.values())
-        })
-        
-        import plotly.express as px
-        from plotly.subplots import make_subplots
-        import plotly.graph_objects as go
-        
-        fig = make_subplots(rows=1, cols=2, subplot_titles=("Total Dwell Time", "Learning Curve"))
-        
-        # Chart 1: Dwell Time Bar
-        bar = px.bar(df_dash, x="AOI", y="Dwell Time (s)", color="AOI")
-        for trace in bar.data:
-            fig.add_trace(trace, row=1, col=1)
-            
-        # Chart 2: Learning Curve
-        task_names = []
-        task_durations = []
-        for i in range(1, 11):
-            tname = f"Task {i}"
-            tdata = self.tasks_data.get(tname, {})
-            start = tdata.get("start")
-            end = tdata.get("end")
-            if start is not None and end is not None and end > start:
-                task_names.append(tname)
-                task_durations.append((end - start) / self.fps)
-                
-        if task_names:
-            line = go.Scatter(x=task_names, y=task_durations, mode='lines+markers', name="Learning Curve", marker=dict(size=12, color="#58A6FF"), line=dict(width=4, color="#1F6FEB"))
-            fig.add_trace(line, row=1, col=2)
-            fig.update_xaxes(title_text="Task", row=1, col=2)
-            fig.update_yaxes(title_text="Duration (s)", row=1, col=2)
-        else:
-            fig.add_annotation(text="No Task Markers set yet.", xref="paper", yref="paper", x=0.75, y=0.5, showarrow=False, font=dict(size=16, color="white"))
-            
-        fig.update_layout(template="plotly_dark", showlegend=False, title_text="Analytics Dashboard", title_font=dict(size=24))
-        
-        raw_html = fig.to_html(include_plotlyjs='cdn', full_html=True)
-        self.web_view.setHtml(raw_html)
-        self._set_status("Dashboard generated successfully.")
-
-
-
-
-def main() -> int:
-    RECORDINGS_DIR.mkdir(exist_ok=True)
-    app = QApplication(sys.argv)
-    if APP_ICON.exists():
-        app.setWindowIcon(QIcon(str(APP_ICON)))
-    window = NeonAoiQtApp()
-    window.show()
-    return app.exec()
-
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("AOIStudio.App")
+        except Exception:
+            pass
+    app = QApplication.instance() or QApplication(sys.argv)
+    app.setStyle("Fusion")
+    _load_app_fonts()
+    app.setFont(QFont(Theme.FONT_UI, 10))
+    icon = resolve_app_icon()
+    if icon:
+        app.setWindowIcon(QIcon(str(icon)))
+    win = MainWindow()
+    win.show()
+    sys.exit(app.exec())
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    main()
