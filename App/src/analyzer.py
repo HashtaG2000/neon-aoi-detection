@@ -124,6 +124,28 @@ def make_camera(recording: nr.NeonRecording) -> Camera:
                   cal.scene_camera_matrix,
                   cal.scene_distortion_coefficients)
 
+
+def sample_gaze(recording: nr.NeonRecording, scene_ts):
+    """Gaze aligned to each scene timestamp.
+
+    The library's ``recording.gaze.sample()`` uses ``pandas.merge_asof``, which
+    raises "right keys must be sorted" when a recording's gaze timestamps are not
+    monotonic (a data glitch present in some recordings). Fall back to sorting the
+    gaze stream and taking the nearest sample per scene frame so analysis still runs.
+    """
+    gd = np.asarray(recording.gaze.data)
+    gts = gd["time"]
+    if len(gts) > 1 and np.any(np.diff(gts) < 0):
+        log.warning("  Gaze timestamps not monotonic — using sorted nearest-sample fallback.")
+        gd = gd[np.argsort(gts, kind="stable")]
+        gts = gd["time"]
+        st = np.asarray(scene_ts)
+        idx = np.clip(np.searchsorted(gts, st), 0, len(gts) - 1)
+        left = np.clip(idx - 1, 0, len(gts) - 1)
+        choose_left = np.abs(gts[left] - st) <= np.abs(gts[idx] - st)
+        return gd[np.where(choose_left, left, idx)].view(np.recarray)
+    return recording.gaze.sample(scene_ts)
+
 def get_expanded_surface_boundary(s2i: np.ndarray, camera: Camera, scale: float = 1.10, n: int = 10) -> np.ndarray:
     """Gets the 2D pixel boundary of the surface, expanded outward by 'scale' to capture edge-gaze."""
     norm_boundary = surface.normalized_boundary_points(n)
@@ -418,7 +440,7 @@ def analyze_recording(
 
     scene_ts   = recording.scene.time
     frames     = recording.scene.sample(scene_ts)
-    gaze_samps = recording.gaze.sample(scene_ts)
+    gaze_samps = sample_gaze(recording, scene_ts)
 
     global_start_idx = 0
     if trim_range is not None:
