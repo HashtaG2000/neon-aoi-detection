@@ -107,7 +107,13 @@ def make_detector(decimate: float = 1.0) -> pupil_apriltags.Detector:
 
 _clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
 def enhance_frame(gray: np.ndarray) -> np.ndarray:
-    return _clahe.apply(gray)
+    """Normalise the frame so AprilTags decode reliably in all lighting/blur.
+    The rig and lighting are physically constant across recordings, so this is
+    tuned once: CLAHE evens out brightness/contrast, then a mild unsharp mask
+    counters motion blur. Applied identically in calibration and the main pass."""
+    eq = _clahe.apply(gray)
+    blur = cv2.GaussianBlur(eq, (0, 0), 1.0)
+    return cv2.addWeighted(eq, 1.5, blur, -0.5, 0)
 
 
 # ── Geometry & Hit-Test Helpers ───────────────────────────────────────────────
@@ -591,8 +597,10 @@ def analyze_recording(
                 # (from every visible placed tag) localises ALL surfaces, so each
                 # surface's quad is available even when its own tags are hidden.
                 loc = scene_model.localize(detections)
-                if loc is not None:
-                    rvec, tvec = loc
+                # Only attribute gaze when the camera pose is well-constrained; a
+                # shaky pose would project every quad to the wrong place.
+                if loc is not None and loc[2] <= rigid_surface.CAMERA_MAX_REPROJ_PX:
+                    rvec, tvec = loc[0], loc[1]
                     best_rank = None
                     for aoi_name, aoi_ids in AOI_CONFIG.items():
                         quad = scene_model.project_quad(aoi_name, rvec, tvec)

@@ -58,6 +58,13 @@ SCREEN_CORNER_IDS = {"TL": 12, "TR": 14, "BR": 15, "BL": 13}
 
 ANCHOR_SURFACE = "Board"      # most-visible surface; defines the world origin
 
+# A surface whose own tags reproject worse than this (when the camera is localised
+# from the anchor) is considered mis-placed and dropped from the model.
+SURFACE_DROP_PX = 30.0
+# Frames whose camera pose reprojects worse than this are too unreliable to attribute
+# gaze to any AOI (avoids phantom hits from a shaky pose).
+CAMERA_MAX_REPROJ_PX = 18.0
+
 
 # ── SE(3) helpers ─────────────────────────────────────────────────────────────
 
@@ -82,6 +89,35 @@ def _avg_se3(mats: list[np.ndarray]) -> np.ndarray:
     M[:3, :3] = R
     M[:3, 3] = t
     return M
+
+
+def _robust_se3(mats: list[np.ndarray]) -> np.ndarray:
+    """Outlier-robust average of rigid transforms: keep the translations close to
+    the median (rejects IPPE pose flips / grazing-angle noise), then average."""
+    if len(mats) <= 2:
+        return _avg_se3(mats)
+    ts = np.array([m[:3, 3] for m in mats])
+    med = np.median(ts, axis=0)
+    d = np.linalg.norm(ts - med, axis=1)
+    thr = max(0.02, 2.5 * float(np.median(d)))   # 2 cm floor
+    inliers = [m for m, di in zip(mats, d) if di <= thr]
+    return _avg_se3(inliers if inliers else mats)
+
+
+def _is_valid_quad(p: np.ndarray) -> bool:
+    """Reject degenerate / self-intersecting / collapsed projected quads."""
+    if p.shape[0] != 4 or not np.all(np.isfinite(p)):
+        return False
+    signs = []
+    for i in range(4):
+        a = p[(i + 1) % 4] - p[i]
+        b = p[(i + 2) % 4] - p[(i + 1) % 4]
+        signs.append(np.sign(a[0] * b[1] - a[1] * b[0]))
+    if len({s for s in signs if s != 0}) > 1:      # not convex -> self-intersecting
+        return False
+    area = 0.5 * abs((p[2][0] - p[0][0]) * (p[3][1] - p[1][1]) -
+                     (p[3][0] - p[1][0]) * (p[2][1] - p[0][1]))
+    return area > 60.0                              # not collapsed to a sliver
 
 
 def _kabsch(src: np.ndarray, dst: np.ndarray) -> np.ndarray:
@@ -176,8 +212,9 @@ class SceneModel:
     calib_report: dict = field(default_factory=dict)
 
     # -- per-frame use ---------------------------------------------------------
-    def localize(self, detections) -> tuple[np.ndarray, np.ndarray] | None:
-        """Camera pose (rvec,tvec) from every visible placed tag."""
+    def localize(self, detections) -> tuple[np.ndarray, np.ndarray, float, int] | None:
+        """Camera pose from every visible placed tag.
+        Returns (rvec, tvec, mean_reprojection_px, n_tags) or None."""
         obj, img = [], []
         for d in detections:
             wc = self.world_tag_corners.get(d.tag_id)
@@ -192,14 +229,25 @@ class SceneModel:
         ok, rvec, tvec = cv2.solvePnP(obj, img, self.K, self.D, flags=flag)
         if not ok:
             return None
-        return rvec, tvec
+        proj, _ = cv2.projectPoints(obj, rvec, tvec, self.K, self.D)
+        err = float(np.linalg.norm(proj.reshape(-1, 2) - img, axis=1).mean())
+        return rvec, tvec, err, len(obj) // 4
 
     def project_quad(self, surface: str, rvec: np.ndarray, tvec: np.ndarray) -> np.ndarray | None:
+        """Projected AOI quad, or None if the surface is behind the camera or the
+        projection is geometrically invalid (guards against phantom quads)."""
         quad = self.surface_quad_world.get(surface)
         if quad is None:
             return None
+        R, _ = cv2.Rodrigues(rvec)
+        center_cam = R @ quad.mean(axis=0) + tvec.reshape(3)
+        if center_cam[2] <= 0.05:                 # behind / on the camera plane
+            return None
         proj, _ = cv2.projectPoints(quad, rvec, tvec, self.K, self.D)
-        return proj.reshape(-1, 2).astype(np.float32)
+        p = proj.reshape(-1, 2).astype(np.float32)
+        if not _is_valid_quad(p):
+            return None
+        return p
 
     def gaze_to_surface(
         self, surface: str, gx: float, gy: float, rvec: np.ndarray, tvec: np.ndarray,
@@ -284,19 +332,60 @@ def calibrate_scene(
             changed = False
             for (a, b), mats in rel.items():
                 if a in world_pose and b not in world_pose and len(mats) >= 3:
-                    world_pose[b] = world_pose[a] @ _avg_se3(mats)
+                    world_pose[b] = world_pose[a] @ _robust_se3(mats)
                     changed = True
 
     model = SceneModel(K=K, D=D, surface_tags={})
 
-    # world tag corners + outer quads for placed non-screen surfaces
-    for surf in world_pose:
-        W = world_pose[surf]
+    def _place(surf, W):
         for t, local in templates[surf].items():
             model.world_tag_corners[t] = (W @ np.hstack([local, np.ones((4, 1))]).T).T[:, :3]
         L, H = (SURFACE_DIMS_CM.get(surf) or (STREAM_DECK_SEP_CM + TAG_SIZE_M * 100, TAG_SIZE_M * 100))
         model.surface_quad_world[surf] = (W @ np.hstack([_outer_quad_local(L, H), np.ones((4, 1))]).T).T[:, :3]
         model.surface_tags[surf] = list(templates[surf])
+
+    for surf in world_pose:
+        _place(surf, world_pose[surf])
+
+    # Validate placement by leave-one-surface-out reprojection: localise the camera
+    # from every OTHER placed tag, then reproject the surface's own tags. A surface
+    # that a noisy calibration mis-placed reprojects far off. Iterate — drop the worst
+    # offender, then re-check the rest with it removed (so one bad surface can't drag
+    # the others down). Result: a surface is kept only if it is geometrically
+    # consistent with the rest of the rig; otherwise it becomes NoAOI (never a
+    # phantom hit).
+    def _surface_reproj(surf):
+        stags = set(templates[surf])
+        errs = []
+        for fr in frames:
+            svis = [t for t in stags if t in fr and t in model.world_tag_corners]
+            others = [t for t in fr if t in model.world_tag_corners and t not in stags]
+            if not svis or len(others) < 2:
+                continue
+            ok, rv, tv = cv2.solvePnP(
+                np.vstack([model.world_tag_corners[t] for t in others]),
+                np.vstack([fr[t] for t in others]), K, D, flags=cv2.SOLVEPNP_ITERATIVE)
+            if not ok:
+                continue
+            for t in svis:
+                pr, _ = cv2.projectPoints(model.world_tag_corners[t], rv, tv, K, D)
+                errs.append(float(np.linalg.norm(pr.reshape(-1, 2) - fr[t], axis=1).mean()))
+        return (float(np.median(errs)), len(errs)) if errs else (0.0, 0)
+
+    while True:
+        worst, worst_err = None, SURFACE_DROP_PX
+        for surf in [s for s in world_pose if s != anchor]:
+            med, n = _surface_reproj(surf)
+            if n >= 3 and med > worst_err:
+                worst, worst_err = surf, med
+        if worst is None:
+            break
+        for t in list(templates[worst]):
+            model.world_tag_corners.pop(t, None)
+        model.surface_quad_world.pop(worst, None)
+        model.surface_tags.pop(worst, None)
+        world_pose.pop(worst, None)
+        _log(f"  Dropped mis-placed surface {worst} (reproj {worst_err:.0f}px > {SURFACE_DROP_PX:.0f}px)")
 
     # 4. Accurate camera poses from non-screen world tags ----------------------
     def cam_pose(fr):
