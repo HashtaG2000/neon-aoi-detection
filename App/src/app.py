@@ -1545,22 +1545,54 @@ class DashboardWidget(QWidget):
 
         lbl_col = "final_primary_aoi" if "final_primary_aoi" in df.columns else "primary_aoi"
         df["_aoi"] = df[lbl_col].fillna(NONE_LABEL).astype(str)
-        total = len(df)
 
-        # Estimate fps from time_s column
+        # Estimate fps from the full recording's time_s (stable regardless of task).
         fps = 30.0
-        if "time_s" in df.columns and total > 1:
+        if "time_s" in df.columns and len(df) > 1:
             times = pd.to_numeric(df["time_s"], errors="coerce").dropna()
             dur = float(times.iloc[-1] - times.iloc[0]) if len(times) > 1 else 0.0
             if dur > 0:
                 fps = max(1.0, (len(times) - 1) / dur)
 
-        self._pop_dq_tab(rec_dir, df, total, fps)
-        self._pop_dwell_tab(df, total, fps)
-        self._pop_fixation_tab(rec_dir)
-        self._pop_heatmap_tab(df)
-        self._pop_transition_tab(df)
+        # Task filter drives EVERY tab: slice the per-frame data to the selected
+        # task's [start,end] frame range so dwell/fixation/heatmap/transition all
+        # reflect just that task (was previously applied to the Learning tab only).
+        bounds = self._load_task_bounds(rec_dir, task_filter)
+        dft = self._slice_task(df, bounds)
+        total = len(dft)
+
+        self._pop_dq_tab(rec_dir, dft, total, fps)
+        self._pop_dwell_tab(dft, total, fps)
+        self._pop_fixation_tab(rec_dir, bounds)
+        self._pop_heatmap_tab(dft)
+        self._pop_transition_tab(dft)
         self._pop_learning_tab(rec_dir, fps, task_filter)
+
+    @staticmethod
+    def _load_task_bounds(rec_dir: pathlib.Path, task_filter: str) -> tuple | None:
+        """(start_frame, end_frame) for the selected task, or None for All Tasks."""
+        if task_filter == "All Tasks":
+            return None
+        for p in [rec_dir / "aoi_results" / "tasks.json",
+                  rec_dir / "aoi_results" / "raw" / "tasks.json"]:
+            if p.exists():
+                try:
+                    td = json.loads(p.read_text(encoding="utf-8")).get(task_filter)
+                except Exception:
+                    return None
+                if isinstance(td, dict):
+                    s, e = td.get("start"), td.get("end")
+                    if s is not None and e is not None and int(e) > int(s):
+                        return int(s), int(e)
+                return None
+        return None
+
+    @staticmethod
+    def _slice_task(df: pd.DataFrame, bounds: tuple | None) -> pd.DataFrame:
+        if bounds is None or "frame_idx" not in df.columns:
+            return df
+        fi = pd.to_numeric(df["frame_idx"], errors="coerce")
+        return df[(fi >= bounds[0]) & (fi <= bounds[1])].copy()
 
     # ── Tab 1: Data Quality ───────────────────────────────────────────────────
 
@@ -1696,7 +1728,7 @@ td{{border-bottom:1px solid rgba(255,255,255,.04)}}
 
     # ── Tab 3: Fixation Metrics ───────────────────────────────────────────────
 
-    def _pop_fixation_tab(self, rec_dir: pathlib.Path) -> None:
+    def _pop_fixation_tab(self, rec_dir: pathlib.Path, bounds: tuple | None = None) -> None:
         view = self._rec_tab_views["fixations"]
         fix_path = None
         for p in [rec_dir / "aoi_results" / "raw" / "fixation_summary.csv",
@@ -1714,6 +1746,14 @@ td{{border-bottom:1px solid rgba(255,255,255,.04)}}
         except Exception as exc:
             view.setHtml(self._no_data_html(str(exc)))
             return
+
+        # Task filter: keep fixations whose start falls inside the task range.
+        if bounds is not None and "start_frame" in fdf.columns:
+            sf = pd.to_numeric(fdf["start_frame"], errors="coerce")
+            fdf = fdf[(sf >= bounds[0]) & (sf <= bounds[1])]
+            if fdf.empty:
+                view.setHtml(self._no_data_html("No fixations in the selected task range."))
+                return
 
         rows = []
         for aoi in AOI_NAMES:
@@ -1941,17 +1981,27 @@ td{{border-bottom:1px solid rgba(255,255,255,.04)}}
         return csv_path.parent.parent.parent if csv_path.parent.name == "raw" \
                else csv_path.parent.parent
 
+    def _agg_load(self, csv_path: pathlib.Path, task_filter: str):
+        """Read one recording's analysis, add _aoi, and slice to that recording's
+        own task range so aggregate tabs aggregate the SAME task across recordings.
+        Returns (sliced_df, bounds)."""
+        df = pd.read_csv(csv_path)
+        lbl_col = "final_primary_aoi" if "final_primary_aoi" in df.columns else "primary_aoi"
+        df["_aoi"] = df[lbl_col].fillna(NONE_LABEL).astype(str)
+        bounds = self._load_task_bounds(self._rec_dir_from_csv(csv_path), task_filter)
+        return self._slice_task(df, bounds), bounds
+
     def _generate_aggregate(self, csvs: list[tuple[str, pathlib.Path]],
                             task_filter: str) -> None:
         self._pop_agg_dq_tab(csvs)
         QApplication.processEvents()
-        self._pop_agg_dwell_tab(csvs)
+        self._pop_agg_dwell_tab(csvs, task_filter)
         QApplication.processEvents()
-        self._pop_agg_fixation_tab(csvs)
+        self._pop_agg_fixation_tab(csvs, task_filter)
         QApplication.processEvents()
-        self._pop_agg_heatmap_tab(csvs)
+        self._pop_agg_heatmap_tab(csvs, task_filter)
         QApplication.processEvents()
-        self._pop_agg_transition_tab(csvs)
+        self._pop_agg_transition_tab(csvs, task_filter)
         QApplication.processEvents()
         self._pop_agg_learning_tab(csvs, task_filter)
 
@@ -2065,16 +2115,16 @@ td{{border-bottom:1px solid rgba(255,255,255,.04)}}
 
     # ── Aggregate Tab 2: Dwell Time ───────────────────────────────────────────
 
-    def _pop_agg_dwell_tab(self, csvs: list[tuple[str, pathlib.Path]]):
+    def _pop_agg_dwell_tab(self, csvs: list[tuple[str, pathlib.Path]], task_filter: str = "All Tasks"):
         view = self._agg_tab_views["dwell"]
         dwell_rows: list[dict] = []
         fps = 30.0
         for rec_name, csv_path in csvs:
             try:
-                df = pd.read_csv(csv_path)
-                lbl_col = "final_primary_aoi" if "final_primary_aoi" in df.columns else "primary_aoi"
-                df["_aoi"] = df[lbl_col].fillna(NONE_LABEL).astype(str)
+                df, _b = self._agg_load(csv_path, task_filter)
                 total = max(1, len(df))
+                if total <= 1:
+                    continue
                 for aoi in AOI_NAMES:
                     cnt = int((df["_aoi"] == aoi).sum())
                     dwell_rows.append({"recording": rec_name, "AOI": aoi,
@@ -2118,16 +2168,20 @@ td{{border-bottom:1px solid rgba(255,255,255,.04)}}
 
     # ── Aggregate Tab 3: Fixation Metrics ─────────────────────────────────────
 
-    def _pop_agg_fixation_tab(self, csvs: list[tuple[str, pathlib.Path]]):
+    def _pop_agg_fixation_tab(self, csvs: list[tuple[str, pathlib.Path]], task_filter: str = "All Tasks"):
         view = self._agg_tab_views["fixations"]
         rows: list[dict] = []
         for rec_name, csv_path in csvs:
             rec_dir = self._rec_dir_from_csv(csv_path)
+            bounds = self._load_task_bounds(rec_dir, task_filter)
             for fix_path in [rec_dir / "aoi_results" / "raw" / "fixation_summary.csv",
                              rec_dir / "aoi_results" / "fixation_summary.csv"]:
                 if fix_path.exists() and fix_path.stat().st_size > 0:
                     try:
                         fdf = pd.read_csv(fix_path)
+                        if bounds is not None and "start_frame" in fdf.columns:
+                            sf = pd.to_numeric(fdf["start_frame"], errors="coerce")
+                            fdf = fdf[(sf >= bounds[0]) & (sf <= bounds[1])]
                         for aoi in AOI_NAMES:
                             aoi_rows = fdf[fdf["dominant_aoi"] == aoi]
                             rows.append({
@@ -2175,16 +2229,14 @@ td{{border-bottom:1px solid rgba(255,255,255,.04)}}
 
     # ── Aggregate Tab 4: AOI Heatmaps ─────────────────────────────────────────
 
-    def _pop_agg_heatmap_tab(self, csvs: list[tuple[str, pathlib.Path]]):
+    def _pop_agg_heatmap_tab(self, csvs: list[tuple[str, pathlib.Path]], task_filter: str = "All Tasks"):
         view = self._agg_tab_views["heatmaps"]
         aoi_gaze: dict[str, tuple[list, list]] = {a: ([], []) for a in AOI_NAMES}
         for _rec_name, csv_path in csvs:
             try:
-                df = pd.read_csv(csv_path)
+                df, _b = self._agg_load(csv_path, task_filter)
                 if "gaze_on_aoi_x" not in df.columns or "gaze_on_aoi_y" not in df.columns:
                     continue
-                lbl_col = "final_primary_aoi" if "final_primary_aoi" in df.columns else "primary_aoi"
-                df["_aoi"] = df[lbl_col].fillna(NONE_LABEL).astype(str)
                 for aoi in AOI_NAMES:
                     sub = df[df["_aoi"] == aoi]
                     if "is_fixation" in sub.columns:
@@ -2238,14 +2290,13 @@ td{{border-bottom:1px solid rgba(255,255,255,.04)}}
 
     # ── Aggregate Tab 5: Transition Matrix ────────────────────────────────────
 
-    def _pop_agg_transition_tab(self, csvs: list[tuple[str, pathlib.Path]]):
+    def _pop_agg_transition_tab(self, csvs: list[tuple[str, pathlib.Path]], task_filter: str = "All Tasks"):
         view = self._agg_tab_views["transitions"]
         matrices: list[pd.DataFrame] = []
         for _rec_name, csv_path in csvs:
             try:
-                df = pd.read_csv(csv_path)
-                lbl_col = "final_primary_aoi" if "final_primary_aoi" in df.columns else "primary_aoi"
-                labels = df[lbl_col].fillna(NONE_LABEL).astype(str)
+                df, _b = self._agg_load(csv_path, task_filter)
+                labels = df["_aoi"]
                 matrix = pd.DataFrame(0, index=AOI_NAMES, columns=AOI_NAMES, dtype=int)
                 arr = labels.values
                 for i in range(len(arr) - 1):
