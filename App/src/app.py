@@ -3490,6 +3490,13 @@ class MainWindow(QMainWindow):
         self._tabs = QTabWidget()
         self.setCentralWidget(self._tabs)
 
+        # Menu bar — batch/overnight analysis lives here, out of the workflow panel.
+        analyse_menu = self.menuBar().addMenu("Analyse")
+        self._batch_action = QAction("Analyse all in condition…", self)
+        self._batch_action.setToolTip("Re-run analysis on every recording in the current condition")
+        self._batch_action.triggered.connect(self._run_batch_analysis)
+        analyse_menu.addAction(self._batch_action)
+
         # Top-right corner (beside the tab bar): Save + Export + Help. Frees the
         # lower-left panel and keeps the primary output actions always reachable.
         help_btn = QPushButton("?")
@@ -3571,6 +3578,14 @@ class MainWindow(QMainWindow):
         rec_row.addWidget(refresh_btn)
         left_layout.addLayout(rec_row)
 
+        # Filter the recording list by analysis status (🟢 analysed / ⚪ pending).
+        self._rec_filter_combo = QComboBox()
+        self._rec_filter_combo.addItem("All recordings", "all")
+        self._rec_filter_combo.addItem("🟢  Analysed", "done")
+        self._rec_filter_combo.addItem("⚪  Pending", "pending")
+        self._rec_filter_combo.setToolTip("Show all recordings, only analysed, or only those still needing analysis")
+        left_layout.addWidget(self._rec_filter_combo)
+
         self._load_btn = QPushButton("Load")
         self._load_btn.setObjectName("primaryButton")
         self._load_btn.setToolTip("Load the selected recording into the player")
@@ -3583,12 +3598,6 @@ class MainWindow(QMainWindow):
         self._analyze_btn.setEnabled(False)
         left_layout.addWidget(self._analyze_btn)
 
-        self._batch_analyze_btn = QPushButton("  Re-analyse")
-        self._batch_analyze_btn.setIcon(_svg_icon("playbutton.svg"))
-        self._batch_analyze_btn.setIconSize(QSize(14, 14))
-        self._batch_analyze_btn.setToolTip("Re-run analysis on every recording in the current condition (generates new output files)")
-        self._batch_analyze_btn.setEnabled(True)
-        left_layout.addWidget(self._batch_analyze_btn)
 
         self._progress_bar = QProgressBar()
         self._progress_bar.setRange(0, 100)
@@ -3697,12 +3706,12 @@ class MainWindow(QMainWindow):
 
     def _wire(self) -> None:
         self._src_combo.currentIndexChanged.connect(self._refresh_recordings)
+        self._rec_filter_combo.currentIndexChanged.connect(self._refresh_recordings)
         self._browse_src_btn.clicked.connect(self._browse_source)
         self._browse_rec_btn.clicked.connect(self._browse_recording)
         self._refresh_btn.clicked.connect(self._refresh_recordings)
         self._load_btn.clicked.connect(self._load_selected)
         self._analyze_btn.clicked.connect(self._run_analysis)
-        self._batch_analyze_btn.clicked.connect(self._run_batch_analysis)
         self._save_tasks_btn.clicked.connect(self._manual_save_tasks)
         self._export_btn.clicked.connect(self._export_final)
 
@@ -3751,14 +3760,33 @@ class MainWindow(QMainWindow):
         """Get the currently selected source directory."""
         return self._src_combo.currentData()
 
+    @staticmethod
+    def _is_analysed(d: pathlib.Path) -> bool:
+        return ((d / "aoi_results" / "raw" / "analysis.csv").exists() or
+                (d / "aoi_results" / "analysis.csv").exists())
+
     def _refresh_recordings(self) -> None:
+        prev = self._rec_combo.currentData()
+        self._rec_combo.blockSignals(True)
         self._rec_combo.clear()
         src: Optional[pathlib.Path] = self._src_combo.currentData()
-        if src is None or not src.exists():
-            return
-        for d in sorted(src.iterdir()):
-            if d.is_dir() and (d / "info.json").exists():
-                self._rec_combo.addItem(d.name, userData=d)
+        if src is not None and src.exists():
+            flt = self._rec_filter_combo.currentData()
+            for d in sorted(src.iterdir()):
+                if not (d.is_dir() and (d / "info.json").exists()):
+                    continue
+                done = self._is_analysed(d)
+                if flt == "done" and not done:
+                    continue
+                if flt == "pending" and done:
+                    continue
+                self._rec_combo.addItem(f"{'🟢' if done else '⚪'}  {d.name}", userData=d)
+        if prev is not None:                       # keep the current selection
+            for i in range(self._rec_combo.count()):
+                if self._rec_combo.itemData(i) == prev:
+                    self._rec_combo.setCurrentIndex(i)
+                    break
+        self._rec_combo.blockSignals(False)
 
     def _browse_source(self) -> None:
         path = QFileDialog.getExistingDirectory(self, "Select source folder", str(RECORDINGS_DIR))
@@ -3997,7 +4025,7 @@ class MainWindow(QMainWindow):
         if reply != QMessageBox.Yes:
             return
 
-        self._batch_analyze_btn.setEnabled(False)
+        self._batch_action.setEnabled(False)
         self._status_lbl.setText("Batch analysis starting…")
 
         self._analysis_generation += 1
@@ -4011,14 +4039,15 @@ class MainWindow(QMainWindow):
     def _on_batch_analysis_done(self, generation: int) -> None:
         if generation != self._analysis_generation:
             return
-        self._batch_analyze_btn.setEnabled(True)
+        self._batch_action.setEnabled(True)
+        self._refresh_recordings()   # update 🟢/⚪ status dots
         self._status_lbl.setText("Batch analysis complete. All recordings updated.")
         QMessageBox.information(self, APP_TITLE, "Batch analysis complete!\n\nAll recordings have been re-analysed with new output files.")
 
     def _on_batch_analysis_failed(self, msg: str, generation: int) -> None:
         if generation != self._analysis_generation:
             return
-        self._batch_analyze_btn.setEnabled(True)
+        self._batch_action.setEnabled(True)
         self._status_lbl.setText("Batch analysis failed.")
         QMessageBox.warning(self, APP_TITLE, f"Batch analysis failed:\n{msg}")
 
@@ -4042,6 +4071,8 @@ class MainWindow(QMainWindow):
         self._progress_bar.hide()
         self._load_analysis_if_ready()
         self._load_quality()
+        self._refresh_recordings()   # update 🟢/⚪ status dots
+        self._dashboard.reload()     # keep dashboard in sync with the new analysis
         self._status_lbl.setText("Analysis complete.")
 
     def _on_analysis_failed(self, msg: str, generation: int) -> None:
