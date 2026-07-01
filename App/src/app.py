@@ -917,6 +917,7 @@ class TrimPanel(QWidget):
         self._start: Optional[int] = None
         self._end: Optional[int] = None
         self._current_frame = 0
+        self._undo_stack: list[tuple] = []
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -928,12 +929,16 @@ class TrimPanel(QWidget):
         self._out_btn = QPushButton("Out")
         self._clear_btn = QPushButton("Clear")
         self._clear_btn.setObjectName("iconButton")
+        self._undo_btn = QPushButton("Undo")
+        self._undo_btn.setObjectName("iconButton")
         self._in_btn.setToolTip("Mark trim start at the current frame")
         self._out_btn.setToolTip("Mark trim end at the current frame")
         self._clear_btn.setToolTip("Remove trim — analyse the full recording")
+        self._undo_btn.setToolTip("Undo the last trim change")
         btn_row.addWidget(self._in_btn)
         btn_row.addWidget(self._out_btn)
         btn_row.addWidget(self._clear_btn)
+        btn_row.addWidget(self._undo_btn)
         layout.addLayout(btn_row)
 
         self._range_lbl = QLabel("Full recording (no trim)")
@@ -962,24 +967,37 @@ class TrimPanel(QWidget):
         self._in_btn.clicked.connect(self._set_in)
         self._out_btn.clicked.connect(self._set_out)
         self._clear_btn.clicked.connect(self._clear)
+        self._undo_btn.clicked.connect(self._undo)
         self._pad_spin.valueChanged.connect(lambda _: self._emit_changed())
 
     def set_current_frame(self, idx: int) -> None:
         self._current_frame = idx
 
+    def _push_undo(self) -> None:
+        self._undo_stack.append((self._start, self._end))
+
+    def _undo(self) -> None:
+        if not self._undo_stack:
+            return
+        self._start, self._end = self._undo_stack.pop()
+        self._refresh()
+
     def _set_in(self) -> None:
+        self._push_undo()
         self._start = self._current_frame
         if self._end is not None and self._end < self._start:
             self._end = None
         self._refresh()
 
     def _set_out(self) -> None:
+        self._push_undo()
         self._end = self._current_frame
         if self._start is not None and self._start > self._end:
             self._start = None
         self._refresh()
 
     def _clear(self) -> None:
+        self._push_undo()
         self._start = None
         self._end = None
         self._refresh()
@@ -1025,6 +1043,7 @@ class CorrectionPanel(QWidget):
     """Manual AOI relabelling for frames or a marked range."""
     correctionApplied = Signal(bool)  # True = apply marked range, False = current frame only
     correctionSaved = Signal()
+    undoRequested = Signal()
 
     def __init__(self) -> None:
         super().__init__()
@@ -1052,20 +1071,23 @@ class CorrectionPanel(QWidget):
         self._apply_btn = QPushButton("Apply")
         self._apply_btn.setObjectName("primaryButton")
         self._save_btn = QPushButton("Save")
-        
+        self._undo_btn = QPushButton("Undo")
+
         self._frame_btn.setToolTip("Apply the selected AOI to the current frame")
         self._in_btn.setToolTip("Mark range start at the current frame")
         self._out_btn.setToolTip("Mark range end at the current frame")
         self._apply_btn.setToolTip("Apply the selected AOI to every frame in the marked range")
         self._save_btn.setToolTip("Save corrections back to analysis.csv (Updates dashboard)")
-        
+        self._undo_btn.setToolTip("Undo the last correction")
+
         btn_row1.addWidget(self._frame_btn)
         btn_row1.addWidget(self._in_btn)
         btn_row1.addWidget(self._out_btn)
-        
+
         btn_row2.addWidget(self._apply_btn)
+        btn_row2.addWidget(self._undo_btn)
         btn_row2.addWidget(self._save_btn)
-        
+
         layout.addLayout(btn_row1)
         layout.addLayout(btn_row2)
 
@@ -1079,6 +1101,7 @@ class CorrectionPanel(QWidget):
         self._out_btn.clicked.connect(self._set_out)
         self._apply_btn.clicked.connect(self._apply_range)
         self._save_btn.clicked.connect(self.correctionSaved.emit)
+        self._undo_btn.clicked.connect(self.undoRequested.emit)
 
     def set_current_frame(self, idx: int) -> None:
         self._current_frame = idx
@@ -3696,6 +3719,7 @@ class MainWindow(QMainWindow):
         self._trim_panel._crop_btn.clicked.connect(self._on_crop_data_requested)
         self._correction_panel.correctionApplied.connect(self._on_correction_applied)
         self._correction_panel.correctionSaved.connect(self._on_correction_saved)
+        self._correction_panel.undoRequested.connect(self._undo_correction)
 
         # Shortcuts
         for key, fn in [
@@ -3850,18 +3874,37 @@ class MainWindow(QMainWindow):
             frames = range(lo, hi + 1)
         else:
             frames = [self._video.frame_idx]
+        # Snapshot the affected frames so this correction can be undone one step.
+        snapshot = [(f, self._edit_labels[f], self._edit_sources[f])
+                    for f in frames if 0 <= f < len(self._edit_labels)]
+        if snapshot:
+            self._undo_stack.append(snapshot)
         for f in frames:
             if 0 <= f < len(self._edit_labels):
                 self._edit_labels[f] = aoi
                 self._edit_sources[f] = "manual"
-        display_labels = list(self._edit_labels)
+        self._refresh_correction_timeline()
+        self._status_lbl.setText(f"Corrected {len(frames)} frame(s) → {aoi.replace('_', ' ')}")
+
+    def _refresh_correction_timeline(self) -> None:
         self._timeline.set_analysis(
-            display_labels,
+            list(self._edit_labels),
             self._timeline._gaze_x,
             self._timeline._gaze_y,
             self._timeline._fix_frames,
         )
-        self._status_lbl.setText(f"Corrected {len(frames)} frame(s) → {aoi.replace('_', ' ')}")
+
+    def _undo_correction(self) -> None:
+        if not self._undo_stack:
+            self._status_lbl.setText("Nothing to undo.")
+            return
+        snapshot = self._undo_stack.pop()
+        for f, lbl, src in snapshot:
+            if 0 <= f < len(self._edit_labels):
+                self._edit_labels[f] = lbl
+                self._edit_sources[f] = src
+        self._refresh_correction_timeline()
+        self._status_lbl.setText(f"Undid correction on {len(snapshot)} frame(s).")
 
     def _on_correction_saved(self) -> None:
         if not self._rec_dir or not self._edit_labels:
