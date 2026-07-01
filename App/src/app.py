@@ -1754,6 +1754,13 @@ td{{border-bottom:1px solid rgba(255,255,255,.04)}}
         aois_data = []
         for aoi in AOI_NAMES:
             sub  = df[df["_aoi"] == aoi]
+            # Attention heatmap: keep fixation frames only when available. Longer
+            # fixations span more frames, so this is inherently dwell-weighted, and
+            # saccade frames (gaze in flight) are dropped as noise.
+            if "is_fixation" in sub.columns:
+                fix = sub[sub["is_fixation"].astype(str).str.lower() == "true"]
+                if len(fix) >= 10:
+                    sub = fix
             x    = pd.to_numeric(sub["gaze_on_aoi_x"], errors="coerce").dropna().values
             y    = pd.to_numeric(sub["gaze_on_aoi_y"], errors="coerce").dropna().values
             mask = (x >= 0) & (x <= 1) & (y >= 0) & (y <= 1)
@@ -2180,6 +2187,10 @@ td{{border-bottom:1px solid rgba(255,255,255,.04)}}
                 df["_aoi"] = df[lbl_col].fillna(NONE_LABEL).astype(str)
                 for aoi in AOI_NAMES:
                     sub = df[df["_aoi"] == aoi]
+                    if "is_fixation" in sub.columns:
+                        fix = sub[sub["is_fixation"].astype(str).str.lower() == "true"]
+                        if len(fix) >= 10:
+                            sub = fix
                     x = pd.to_numeric(sub["gaze_on_aoi_x"], errors="coerce").dropna().values
                     y = pd.to_numeric(sub["gaze_on_aoi_y"], errors="coerce").dropna().values
                     mask = (x >= 0) & (x <= 1) & (y >= 0) & (y <= 1)
@@ -3841,7 +3852,7 @@ class MainWindow(QMainWindow):
         worker = AnalysisWorker(
             self._rec_dir,
             trim=self._trim_panel.get_trim(),
-            generate_video=False,  # Validation video removed (user request)
+            generate_video=True,  # validation video to verify surface tracking
             generation=gen,
         )
         worker.signals.status.connect(self._status_lbl.setText)

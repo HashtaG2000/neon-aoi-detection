@@ -434,6 +434,40 @@ def analyze_recording(
     fps = max(1.0, (total - 1) / ((scene_ts[-1] - scene_ts[0]) / 1e9)) if total > 1 else 30.0
     frame_dur_ms = 1000.0 / fps
 
+    # ── Scene-wide rigid-body calibration (pre-pass) ──────────────────────────
+    # Detect tags on a subsample and build ONE rigid model of the whole rig, so
+    # every surface (incl. the rarely-seen Screen, placed by triangulation) can
+    # be localised from any visible tag during the main pass.
+    import rigid_surface
+    _cal = recording.calibration
+    camera_K = np.array(_cal.scene_camera_matrix, dtype=np.float64)
+    camera_D = np.array(_cal.scene_distortion_coefficients, dtype=np.float64).reshape(-1)
+    calib_stride = max(1, total // 700)
+    calib_positions = list(range(0, total, calib_stride))
+    calib_ts = np.array([int(scene_ts[i]) for i in calib_positions])
+    log.info("  Calibrating scene rigid body from %d sampled frames...", len(calib_positions))
+    calib_dets = []
+    for cf in recording.scene.sample(calib_ts):
+        g = enhance_frame(cf.gray)
+        ds = detector_high.detect(g)
+        if len(ds) < 2:
+            ds = detector_low.detect(g)
+        calib_dets.append({d.tag_id: d.corners.astype(np.float64) for d in ds})
+    scene_model = rigid_surface.calibrate_scene(calib_dets, AOI_CONFIG, camera_K, camera_D, log=log)
+
+    def _quad_area(q):
+        return 0.5 * float(np.linalg.norm(np.cross(q[2] - q[0], q[3] - q[1])))
+    # Smaller surfaces win over the large Board behind them when quads overlap.
+    surface_priority = {
+        s: r for r, (s, _a) in enumerate(sorted(
+            ((s, _quad_area(q)) for s, q in scene_model.surface_quad_world.items()),
+            key=lambda kv: kv[1]))
+    }
+
+    # Fresh frame iterator for the main pass (calibration consumed its own).
+    if trim_range is None:
+        frames = recording.scene.sample(scene_ts)
+
     log.info("  Frames: %d  |  FPS: %.1f  |  Duration: %.1f s  |  Fixations: %d", total, fps, total / fps, n_fixations)
 
     out_dir = output_dir or recording_dir / "aoi_results" / "raw"
@@ -466,7 +500,7 @@ def analyze_recording(
     vid_w = int((recording.scene.width  or 1600) * VIDEO_SCALE)
     vid_h = int((recording.scene.height or 1200) * VIDEO_SCALE)
     video_writer = None
-    if GENERATE_VIDEO:
+    if generate_video:
         fourcc       = cv2.VideoWriter_fourcc(*"mp4v")
         video_writer = cv2.VideoWriter(str(video_path), fourcc, fps, (vid_w, vid_h))
         log.info("  Video: %d\u00d7%d @ %.1f fps -> %s", vid_w, vid_h, fps, video_path.name)
@@ -553,93 +587,37 @@ def analyze_recording(
                 primary_marker_count = ""
                 primary_surface_initialized = ""
 
-                # 1. Evaluate Core AOIs via 3D Surface Mapping
-                for aoi in aois:
-                    visible_tags = [d for d in detections if d.tag_id in aoi.marker_ids]
-                    visible_count = len(visible_tags)
-                    
-                    # Fallback logic
-                    fallback_poly = get_fallback_aoi_polygon(detections, aoi.marker_ids)
-                        
-                    if not aoi.is_initialized:
-                        # To build an accurate physical model, we must see ALL tags for this AOI at least once.
-                        # Otherwise, the convex hull wraps only the visible subset (e.g. half the screen).
-                        if visible_count == len(aoi.marker_ids):
-                            try:
-                                aoi.initialize(detections, camera)
-                            except ValueError:
-                                pass # Initialization failed
-                            
-                    loc = aoi.localize(detections, camera)
-                    if loc is not None:
-                        img2surface, s2i = loc
-                        # Get dilated 2D boundary from 3D surface
-                        boundary = get_expanded_surface_boundary(s2i, camera, scale=1.10)
-                        active_polygons[aoi.name] = boundary
-                        surface_xy = _surface_gaze(aoi, gx, gy, camera, img2surface)
-
-                        if _contains_gaze_polygon(boundary, gx, gy):
-                            row_hits[aoi.name] = True
-                            primary_aoi = aoi.name
-                            primary_surface = aoi.name
-                            hit_source = "surface"
-                            if surface_xy is not None:
-                                gaze_on_aoi_x = f"{float(surface_xy[0]):.5f}"
-                                gaze_on_aoi_y = f"{float(surface_xy[1]):.5f}"
-                            primary_marker_count = str(visible_count)
-                            primary_surface_initialized = str(aoi.is_initialized)
-
-                        # 2. Evaluate configured surface-space masks/sub-AOIs.
-                        # These are hit-tested in normalized surface coordinates and can
-                        # come from precise segmentation masks generated outside the app.
-                        if surface_xy is not None:
-                            for region in mask_config.for_surface(aoi.name):
-                                region_poly = _project_region_outline(region, s2i, camera)
-                                if region_poly is not None:
-                                    active_polygons[region.name] = region_poly
-                                if region.contains(surface_xy):
-                                    row_hits[region.name] = True
-                                    row_hits[aoi.name] = True
-                                    primary_aoi = region.name
-                                    primary_surface = aoi.name
-                                    hit_source = region.kind
-                                    gaze_on_aoi_x = f"{float(surface_xy[0]):.5f}"
-                                    gaze_on_aoi_y = f"{float(surface_xy[1]):.5f}"
-                                    primary_marker_count = str(visible_count)
-                                    primary_surface_initialized = str(aoi.is_initialized)
-                                    break
-
-                    # 3. Fallback 2D hit-testing keeps partially visible AOIs
-                    # from turning into NoAOI while waiting for full 3D setup.
-                    if not primary_aoi and fallback_poly is not None:
-                        active_polygons.setdefault(aoi.name, fallback_poly)
-                        fallback_xy = _surface_xy_from_image_quad(fallback_poly, gx, gy)
-                        if fallback_xy is not None:
-                            for region in mask_config.for_surface(aoi.name):
-                                region_poly = _project_region_outline_2d(region, fallback_poly)
-                                if region_poly is not None:
-                                    active_polygons.setdefault(region.name, region_poly)
-                                if region.contains(fallback_xy):
-                                    row_hits[region.name] = True
-                                    row_hits[aoi.name] = True
-                                    primary_aoi = region.name
-                                    primary_surface = aoi.name
-                                    hit_source = f"{region.kind}_fallback_2d"
-                                    gaze_on_aoi_x = f"{float(fallback_xy[0]):.5f}"
-                                    gaze_on_aoi_y = f"{float(fallback_xy[1]):.5f}"
-                                    primary_marker_count = str(visible_count)
-                                    primary_surface_initialized = str(aoi.is_initialized)
-                                    break
-                        if not primary_aoi and _contains_gaze_polygon(fallback_poly, gx, gy):
-                            row_hits[aoi.name] = True
-                            primary_aoi = aoi.name
-                            primary_surface = aoi.name
-                            hit_source = f"fallback_2d_{visible_count}tag"
-                            if fallback_xy is not None:
-                                gaze_on_aoi_x = f"{float(fallback_xy[0]):.5f}"
-                                gaze_on_aoi_y = f"{float(fallback_xy[1]):.5f}"
-                            primary_marker_count = str(visible_count)
-                            primary_surface_initialized = str(aoi.is_initialized)
+                # 1. Evaluate AOIs via the scene-wide rigid body. One camera pose
+                # (from every visible placed tag) localises ALL surfaces, so each
+                # surface's quad is available even when its own tags are hidden.
+                loc = scene_model.localize(detections)
+                if loc is not None:
+                    rvec, tvec = loc
+                    best_rank = None
+                    for aoi_name, aoi_ids in AOI_CONFIG.items():
+                        quad = scene_model.project_quad(aoi_name, rvec, tvec)
+                        if quad is None:
+                            continue
+                        active_polygons[aoi_name] = quad
+                        uv = scene_model.gaze_to_surface(
+                            aoi_name, gx, gy, rvec, tvec, image_quad=quad)
+                        if uv is None:
+                            continue
+                        u, v = uv
+                        # inside the surface (5% edge margin catches border gaze)
+                        if -0.05 <= u <= 1.05 and -0.05 <= v <= 1.05:
+                            row_hits[aoi_name] = True
+                            rank = surface_priority.get(aoi_name, 99)
+                            if best_rank is None or rank < best_rank:
+                                best_rank = rank
+                                primary_aoi = aoi_name
+                                primary_surface = aoi_name
+                                hit_source = "surface"
+                                gaze_on_aoi_x = f"{min(max(u, 0.0), 1.0):.5f}"
+                                gaze_on_aoi_y = f"{min(max(v, 0.0), 1.0):.5f}"
+                                primary_marker_count = str(
+                                    sum(1 for d in detections if d.tag_id in aoi_ids))
+                                primary_surface_initialized = "True"
 
                 # 4. Handle Logging
                 if primary_aoi:
