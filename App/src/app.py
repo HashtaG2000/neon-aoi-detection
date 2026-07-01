@@ -604,7 +604,7 @@ class AOITimeline(QWidget):
     _ROW_GAZE     = 10
     _ROW_FIX      = 10
     _ROW_TASKS    = 20
-    _PAD          = 2
+    _PAD          = 0   # no gap between AOI / Gaze / Fix / Tasks lanes
     _LEFT_MARGIN  = 44   # pixels reserved on the left for row labels
 
     def __init__(self) -> None:
@@ -1485,6 +1485,15 @@ class DashboardWidget(QWidget):
         return src, rec_filter, csvs
 
     # ── Generate ──────────────────────────────────────────────────────────────
+
+    def reload(self) -> None:
+        """Re-read from disk and rebuild the current view (called after a Studio
+        edit/crop so the dashboard stays in sync). Silent no-op if not yet set up."""
+        try:
+            if self._diff_combo.count() > 0:
+                self._generate()
+        except Exception:
+            pass
 
     def _generate(self) -> None:
         src, rec_filter, csvs = self._collect_csvs()
@@ -3458,12 +3467,34 @@ class MainWindow(QMainWindow):
         self._tabs = QTabWidget()
         self.setCentralWidget(self._tabs)
 
+        # Top-right corner (beside the tab bar): Save + Export + Help. Frees the
+        # lower-left panel and keeps the primary output actions always reachable.
         help_btn = QPushButton("?")
         help_btn.setObjectName("iconButton")
         help_btn.setFixedSize(26, 26)
         help_btn.setToolTip("Keyboard shortcuts")
         help_btn.clicked.connect(self._show_shortcuts_help)
-        self._tabs.setCornerWidget(help_btn, Qt.TopRightCorner)
+
+        self._save_tasks_btn = QPushButton("  Save")
+        self._save_tasks_btn.setIcon(_svg_icon("export.svg"))
+        self._save_tasks_btn.setIconSize(QSize(14, 14))
+        self._save_tasks_btn.setToolTip("Save task start/end annotations to disk")
+        self._save_tasks_btn.setEnabled(False)
+
+        self._export_btn = QPushButton("  Export")
+        self._export_btn.setObjectName("primaryButton")
+        self._export_btn.setIcon(_svg_icon("export.svg"))
+        self._export_btn.setIconSize(QSize(14, 14))
+        self._export_btn.setToolTip("Export the corrected AOI labels and tasks to a final CSV")
+
+        corner = QWidget()
+        corner_l = QHBoxLayout(corner)
+        corner_l.setContentsMargins(0, 0, 8, 0)
+        corner_l.setSpacing(6)
+        corner_l.addWidget(self._save_tasks_btn)
+        corner_l.addWidget(self._export_btn)
+        corner_l.addWidget(help_btn)
+        self._tabs.setCornerWidget(corner, Qt.TopRightCorner)
 
         # ── Studio tab ──────────────────────────────────────────────────────
         studio = QWidget()
@@ -3476,7 +3507,7 @@ class MainWindow(QMainWindow):
         # it (e.g. when 5-digit frame numbers crowd the task rows).
         left = QFrame()
         left.setObjectName("leftPanel")
-        left.setMinimumWidth(280)
+        left.setMinimumWidth(308)
         left_layout = QVBoxLayout(left)
         left_layout.setContentsMargins(16, 18, 16, 18)
         left_layout.setSpacing(12)
@@ -3583,23 +3614,8 @@ class MainWindow(QMainWindow):
         task_scroll.setWidget(self._task_panel)
         self._task_box.addWidget(task_scroll, 1)
 
-        self._save_tasks_btn = QPushButton("  Save")
-        self._save_tasks_btn.setIcon(_svg_icon("export.svg"))
-        self._save_tasks_btn.setIconSize(QSize(14, 14))
-        self._save_tasks_btn.setToolTip("Save task start/end annotations to disk")
-        self._save_tasks_btn.setEnabled(False)
-        self._task_box.addWidget(self._save_tasks_btn)
-        
         left_layout.addWidget(self._task_box, 1)
-
-        # ── Export ──
-        self._export_box = CollapsibleBox("EXPORT")
-        self._export_btn = QPushButton("  Export")
-        self._export_btn.setIcon(_svg_icon("export.svg"))
-        self._export_btn.setIconSize(QSize(14, 14))
-        self._export_btn.setToolTip("Export the corrected AOI labels and tasks to a final CSV")
-        self._export_box.addWidget(self._export_btn)
-        left_layout.addWidget(self._export_box)
+        # Save + Export now live in the top-right corner (created above).
 
         # Right: video + controls, and timeline — split so the timeline's
         # height is freely user-resizable by dragging the splitter handle.
@@ -3677,7 +3693,9 @@ class MainWindow(QMainWindow):
 
         self._task_panel.tasksChanged.connect(self._on_tasks_changed)
         self._trim_panel.trimChanged.connect(self._on_trim_changed)
+        self._trim_panel._crop_btn.clicked.connect(self._on_crop_data_requested)
         self._correction_panel.correctionApplied.connect(self._on_correction_applied)
+        self._correction_panel.correctionSaved.connect(self._on_correction_saved)
 
         # Shortcuts
         for key, fn in [
@@ -3858,23 +3876,26 @@ class MainWindow(QMainWindow):
             import pandas as pd
             df = pd.read_csv(csv_path)
             
-            # Apply all manual corrections to the DataFrame
+            # Apply all manual corrections to the DataFrame. Write BOTH primary_aoi
+            # and final_primary_aoi so the dashboard (which prefers final_primary_aoi)
+            # reflects the correction.
+            if "final_primary_aoi" not in df.columns:
+                df["final_primary_aoi"] = df["primary_aoi"]
             changes_made = 0
             for i, (lbl, src) in enumerate(zip(self._edit_labels, self._edit_sources)):
                 if src == "manual" and i < len(df):
                     df.at[i, "primary_aoi"] = lbl
+                    df.at[i, "final_primary_aoi"] = lbl
                     df.at[i, "aoi_hit_source"] = "manual"
                     changes_made += 1
-                    
+
             if changes_made > 0:
-                # Recalculate transitions
-                df['aoi_transition'] = df['primary_aoi'].ne(df['primary_aoi'].shift()) & df['primary_aoi'].notna()
-                # Ensure NoAOI doesn't count as a transition if coming from NoAOI (pandas shift handles this but just to be sure)
-                
+                df['aoi_transition'] = df['final_primary_aoi'].ne(df['final_primary_aoi'].shift()) & df['final_primary_aoi'].notna()
                 df.to_csv(csv_path, index=False)
                 self._status_lbl.setText(f"Saved {changes_made} corrections to analysis.csv")
                 self._correction_panel._save_btn.setText("Saved ✓")
                 QTimer.singleShot(1500, lambda: self._correction_panel._save_btn.setText("Save"))
+                self._dashboard.reload()   # keep the dashboard in sync with the edit
             else:
                 self._status_lbl.setText("No manual corrections to save.")
                 
@@ -4235,7 +4256,8 @@ class MainWindow(QMainWindow):
                 fdf = fdf[(fdf['end_frame'] >= start_f) & (fdf['start_frame'] <= end_f)]
                 fdf.to_csv(raw_fix, index=False)
                 
-            QMessageBox.information(self, APP_TITLE, f"Successfully cropped data from {original_len} to {len(df)} frames.\n\nPlease click the 'Load' button in the Dashboard tab to refresh the charts!")
+            self._dashboard.reload()   # refresh charts automatically
+            QMessageBox.information(self, APP_TITLE, f"Cropped data from {original_len} to {len(df)} frames. Dashboard updated.")
         except Exception as e:
             QMessageBox.critical(self, APP_TITLE, f"Failed to crop data: {e}")
 
