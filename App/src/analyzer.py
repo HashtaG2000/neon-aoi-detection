@@ -394,6 +394,75 @@ def load_fixations(recording: nr.NeonRecording):
         empty = np.array([], dtype=np.int64)
         return empty, empty, np.array([]), np.array([])
 
+
+def write_summaries(out_dir: pathlib.Path, csv_path: pathlib.Path, rec_name: str, fps: float) -> None:
+    """Regenerate the per-recording summary files the dashboard reads:
+    fixation_summary.csv (one row per fixation), data_quality.json and
+    preprocessing_report.json. Rebuilt from analysis.csv after the main pass.
+    (These were lost when the analyzer was refactored, so the Fixation and
+    Data-Quality dashboard tabs read nothing.)"""
+    import pandas as pd
+    df = pd.read_csv(csv_path)
+    n = len(df)
+    if n == 0:
+        return
+    lbl = df["primary_aoi"].fillna("NoAOI").astype(str).replace("", "NoAOI")
+    dur = float(df["time_s"].iloc[-1] - df["time_s"].iloc[0]) if n > 1 else 0.0
+    n_fix = int(df["fixation_id"].dropna().nunique())
+    valid = int(df["gaze_x_px"].notna().sum())
+
+    # ── fixation_summary.csv (one row per fixation) ──
+    cols = ["fixation_id", "start_frame", "end_frame", "start_time_s",
+            "end_time_s", "duration_s", "dominant_aoi", "centroid_x", "centroid_y"]
+    rows = []
+    for fid, g in df.dropna(subset=["fixation_id"]).groupby("fixation_id"):
+        aois = g["primary_aoi"].fillna("NoAOI").astype(str).replace("", "NoAOI")
+        modes = aois.mode()
+        dur_s = (float(g["fixation_dur_ms"].iloc[0]) / 1000.0
+                 if "fixation_dur_ms" in g and pd.notna(g["fixation_dur_ms"].iloc[0])
+                 else float(g["time_s"].max() - g["time_s"].min()))
+        rows.append({
+            "fixation_id": int(fid),
+            "start_frame": int(g["frame_idx"].min()),
+            "end_frame": int(g["frame_idx"].max()),
+            "start_time_s": round(float(g["time_s"].min()), 4),
+            "end_time_s": round(float(g["time_s"].max()), 4),
+            "duration_s": round(dur_s, 4),
+            "dominant_aoi": modes.iloc[0] if len(modes) else "NoAOI",
+            "centroid_x": round(float(g["gaze_x_px"].mean()), 2),
+            "centroid_y": round(float(g["gaze_y_px"].mean()), 2),
+        })
+    fdf = pd.DataFrame(rows, columns=cols) if rows else pd.DataFrame(columns=cols)
+    fdf.to_csv(out_dir / "fixation_summary.csv", index=False, encoding="utf-8")
+
+    # ── data_quality.json ──
+    (out_dir / "data_quality.json").write_text(json.dumps({
+        "recording": rec_name,
+        "total_frames": n,
+        "valid_gaze_frames": valid,
+        "missing_gaze_pct": round(100.0 * (n - valid) / n, 2),
+        "recording_duration_s": round(dur, 2),
+        "fixation_count": n_fix,
+        "fps": round(fps, 1),
+    }, indent=2), encoding="utf-8")
+
+    # ── preprocessing_report.json (dwell / coverage) ──
+    aoi_names = [c[:-4] for c in df.columns if c.endswith("_hit")]
+    dwell = {a: int((lbl == a).sum()) for a in aoi_names}
+    detected = int((lbl != "NoAOI").sum())
+    (out_dir / "preprocessing_report.json").write_text(json.dumps({
+        "recording": rec_name,
+        "total_frames": n,
+        "aoi_detected_frames": detected,
+        "no_aoi_frames": n - detected,
+        "no_aoi_pct": round(100.0 * (n - detected) / n, 2),
+        "fixation_count": n_fix,
+        "fps": round(fps, 1),
+        "recording_duration_s": round(dur, 2),
+        "aoi_dwell_frames": dwell,
+        "aoi_dwell_pct": {a: round(100.0 * v / n, 2) for a, v in dwell.items()},
+    }, indent=2), encoding="utf-8")
+
 # ── Core analysis ─────────────────────────────────────────────────────────────
 
 def analyze_recording(
@@ -723,6 +792,10 @@ def analyze_recording(
             video_writer.release()
             video_writer = None
         write_progress(100.0, total, "complete")
+        try:
+            write_summaries(out_dir, csv_path, recording_dir.name, fps)
+        except Exception as exc:
+            log.warning("  Could not write summary files: %s", exc)
         if processing_path.exists():
             processing_path.unlink()
         log.info("  Done. Results saved in %s", out_dir)
