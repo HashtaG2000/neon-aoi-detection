@@ -372,20 +372,14 @@ def calibrate_scene(
                 errs.append(float(np.linalg.norm(pr.reshape(-1, 2) - fr[t], axis=1).mean()))
         return (float(np.median(errs)), len(errs)) if errs else (0.0, 0)
 
-    while True:
-        worst, worst_err = None, SURFACE_DROP_PX
-        for surf in [s for s in world_pose if s != anchor]:
-            med, n = _surface_reproj(surf)
-            if n >= 3 and med > worst_err:
-                worst, worst_err = surf, med
-        if worst is None:
-            break
-        for t in list(templates[worst]):
-            model.world_tag_corners.pop(t, None)
-        model.surface_quad_world.pop(worst, None)
-        model.surface_tags.pop(worst, None)
-        world_pose.pop(worst, None)
-        _log(f"  Dropped mis-placed surface {worst} (reproj {worst_err:.0f}px > {SURFACE_DROP_PX:.0f}px)")
+    # Keep ALL surfaces (no dropping). Reprojection-from-the-anchor is only a rough
+    # quality hint — a correctly-placed but distant surface can read high purely from
+    # lever-arm noise — so we just log a note; the per-frame projection gating still
+    # skips genuinely bad frames (behind camera / degenerate quad / shaky pose).
+    for surf in [s for s in world_pose if s != anchor]:
+        med, n = _surface_reproj(surf)
+        if n >= 3 and med > SURFACE_DROP_PX:
+            _log(f"  Note: {surf} placement is loose (reproj {med:.0f}px) — kept.")
 
     # 4. Accurate camera poses from non-screen world tags ----------------------
     def cam_pose(fr):
