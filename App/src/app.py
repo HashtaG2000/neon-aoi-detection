@@ -4237,6 +4237,10 @@ class MainWindow(QMainWindow):
                 pos = {f: r for r, f in enumerate(fi.tolist())}
             else:
                 pos = {i: i for i in range(len(df))}
+            # Ensure string labels can be written even if the column was all-NaN (float).
+            df["primary_aoi"] = df["primary_aoi"].astype("object")
+            if "aoi_hit_source" in df.columns:
+                df["aoi_hit_source"] = df["aoi_hit_source"].astype("object")
             changes = 0
             for f, (lbl, src) in enumerate(zip(self._edit_labels, self._edit_sources)):
                 if src == "manual" and f in pos:
