@@ -240,6 +240,52 @@ class BatchAnalysisWorker(threading.Thread):
             self.signals.failed.emit(f"{type(exc).__name__}: {exc}")
 
 
+class WatcherWorker(threading.Thread):
+    """TEMPORARY: sweeps every recording under Recordings/ (both conditions) and
+    analyses the ones without an analysis.csv yet, in the background."""
+    def __init__(self, generation: int = 0) -> None:
+        super().__init__(daemon=True)
+        self.generation = generation
+        self.signals = WorkerSignals()
+        self._stop = threading.Event()
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def run(self) -> None:
+        try:
+            import analyzer
+            conds = sorted(p for p in RECORDINGS_DIR.iterdir() if p.is_dir()) if RECORDINGS_DIR.exists() else []
+            pending = []
+            for cond in conds:
+                for rec in sorted(p for p in cond.iterdir() if p.is_dir()):
+                    if not (rec / "info.json").exists():
+                        continue
+                    done = ((rec / "aoi_results" / "raw" / "analysis.csv").exists()
+                            or (rec / "aoi_results" / "analysis.csv").exists())
+                    if not done:
+                        pending.append(rec)
+            total = len(pending)
+            if total == 0:
+                self.signals.status.emit("Watcher: everything is already analysed.")
+                self.signals.finished.emit()
+                return
+            for i, rec in enumerate(pending, 1):
+                if self._stop.is_set():
+                    self.signals.status.emit("Watcher stopped.")
+                    break
+                self.signals.status.emit(f"Watcher {i}/{total}: {rec.name}")
+                raw = rec / "aoi_results" / "raw"
+                (raw / ".processing").unlink(missing_ok=True)
+                try:
+                    analyzer.analyze_recording(rec, raw, generate_video=False)
+                except Exception as e:
+                    self.signals.status.emit(f"Watcher failed {rec.name}: {e}")
+            self.signals.finished.emit()
+        except Exception as exc:
+            self.signals.failed.emit(f"{type(exc).__name__}: {exc}")
+
+
 class ComparisonWorker(threading.Thread):
     def __init__(self, cond_a: pathlib.Path, cond_b: pathlib.Path) -> None:
         super().__init__(daemon=True)
@@ -3701,6 +3747,12 @@ class MainWindow(QMainWindow):
         self._batch_action.setToolTip("Re-run analysis on every recording in the current condition")
         self._batch_action.triggered.connect(self._run_batch_analysis)
         analyse_menu.addAction(self._batch_action)
+        analyse_menu.addSeparator()
+        self._watcher: Optional[WatcherWorker] = None
+        self._watcher_action = QAction("▶  Auto-analyse all pending (temporary)", self)
+        self._watcher_action.setToolTip("Background sweep: analyse every un-analysed recording across BOTH conditions while you work")
+        self._watcher_action.triggered.connect(self._toggle_watcher)
+        analyse_menu.addAction(self._watcher_action)
 
         # Top-right corner (beside the tab bar): Save + Export + Help. Frees the
         # lower-left panel and keeps the primary output actions always reachable.
@@ -4272,6 +4324,28 @@ class MainWindow(QMainWindow):
         worker.signals.finished.connect(lambda: self._on_batch_analysis_done(gen))
         worker.signals.failed.connect(lambda msg: self._on_batch_analysis_failed(msg, gen))
         worker.start()
+
+    def _toggle_watcher(self) -> None:
+        """TEMPORARY: start/stop a background sweep that analyses every pending
+        recording in both conditions while you keep working."""
+        if self._watcher is not None and self._watcher.is_alive():
+            self._watcher.stop()
+            self._watcher_action.setText("▶  Auto-analyse all pending (temporary)")
+            self._status_lbl.setText("Stopping watcher…")
+            return
+        self._watcher = WatcherWorker()
+        self._watcher.signals.status.connect(self._status_lbl.setText)
+        self._watcher.signals.finished.connect(self._on_watcher_done)
+        self._watcher.signals.failed.connect(
+            lambda m: self._status_lbl.setText(f"Watcher error: {m}"))
+        self._watcher_action.setText("■  Stop auto-analysis")
+        self._status_lbl.setText("Watcher started — analysing pending recordings in the background…")
+        self._watcher.start()
+
+    def _on_watcher_done(self) -> None:
+        self._watcher_action.setText("▶  Auto-analyse all pending (temporary)")
+        self._refresh_recordings()
+        self._status_lbl.setText("Watcher finished — pending recordings analysed.")
 
     def _on_batch_analysis_done(self, generation: int) -> None:
         if generation != self._analysis_generation:
