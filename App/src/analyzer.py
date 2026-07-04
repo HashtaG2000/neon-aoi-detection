@@ -684,22 +684,23 @@ def analyze_recording(
                 primary_marker_count = ""
                 primary_surface_initialized = ""
 
-                # 1. Evaluate AOIs via the scene-wide rigid body. One camera pose
-                # (from every visible placed tag) localises ALL surfaces, so each
-                # surface's quad is available even when its own tags are hidden.
+                # 1. Evaluate AOIs. Each surface forms its quad DIRECTLY from its own
+                # visible tags when present (accurate — this is how the screen makes a
+                # proper rectangle when you look at it); otherwise it falls back to the
+                # rigid-body projection from a well-constrained whole-rig camera pose.
                 loc = scene_model.localize(detections)
-                # Only attribute gaze when the camera pose is well-constrained; a
-                # shaky pose would project every quad to the wrong place.
-                if loc is not None and loc[2] <= rigid_surface.CAMERA_MAX_REPROJ_PX:
-                    rvec, tvec = loc[0], loc[1]
+                good_pose = loc is not None and loc[2] <= rigid_surface.CAMERA_MAX_REPROJ_PX
+                cam_rvec = loc[0] if good_pose else None
+                cam_tvec = loc[1] if good_pose else None
+                if True:
                     best_rank = None
                     for aoi_name, aoi_ids in AOI_CONFIG.items():
-                        quad = scene_model.project_quad(aoi_name, rvec, tvec)
+                        quad = scene_model.surface_quad(aoi_name, detections, cam_rvec, cam_tvec)
                         if quad is None:
                             continue
                         active_polygons[aoi_name] = quad
                         uv = scene_model.gaze_to_surface(
-                            aoi_name, gx, gy, rvec, tvec, image_quad=quad)
+                            aoi_name, gx, gy, cam_rvec, cam_tvec, image_quad=quad)
                         if uv is None:
                             continue
                         u, v = uv
