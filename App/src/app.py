@@ -3484,6 +3484,11 @@ class MainWindow(QMainWindow):
         self._play_timer = QTimer(self)
         self._play_timer.timeout.connect(self._play_tick)
 
+        # Debounced auto-save of AOI corrections (writes straight into analysis.csv).
+        self._autosave_timer = QTimer(self)
+        self._autosave_timer.setSingleShot(True)
+        self._autosave_timer.timeout.connect(lambda: self._save_corrections_to_disk(silent=True))
+
         # State variables for new logic
         self._trim: dict[str, Any] = {}
         self._tasks: dict[str, Any] = {}
@@ -3739,6 +3744,11 @@ class MainWindow(QMainWindow):
             (Qt.Key_D,     lambda: self._video.step(1)),
             (Qt.Key_I,     self._task_panel._on_start),
             (Qt.Key_O,     self._task_panel._on_end),
+            # AOI correction — fast annotation
+            (Qt.Key_F,     self._correction_panel._apply_frame),   # apply AOI to current frame
+            (Qt.Key_J,     self._correction_panel._set_in),        # range In
+            (Qt.Key_K,     self._correction_panel._set_out),       # range Out
+            (Qt.Key_L,     self._correction_panel._apply_range),   # Apply range
         ]:
             act = QAction(self)
             act.setShortcut(key)
@@ -3811,7 +3821,14 @@ class MainWindow(QMainWindow):
         if rec_dir:
             self._load_recording(rec_dir)
 
+    def _flush_autosave(self) -> None:
+        """Write any pending corrections for the CURRENT recording immediately."""
+        if getattr(self, "_autosave_timer", None) is not None and self._autosave_timer.isActive():
+            self._autosave_timer.stop()
+            self._save_corrections_to_disk(silent=True)
+
     def _load_recording(self, rec_dir: pathlib.Path) -> None:
+        self._flush_autosave()   # persist edits on the OUTGOING recording first
         self._status_lbl.setText("Loading…")
         QApplication.processEvents()
         try:
@@ -3912,6 +3929,7 @@ class MainWindow(QMainWindow):
                 self._edit_labels[f] = aoi
                 self._edit_sources[f] = "manual"
         self._refresh_correction_timeline()
+        self._schedule_autosave()
         self._status_lbl.setText(f"Corrected {len(frames)} frame(s) → {aoi.replace('_', ' ')}")
 
     def _refresh_correction_timeline(self) -> None:
@@ -3932,46 +3950,58 @@ class MainWindow(QMainWindow):
                 self._edit_labels[f] = lbl
                 self._edit_sources[f] = src
         self._refresh_correction_timeline()
+        self._schedule_autosave()
         self._status_lbl.setText(f"Undid correction on {len(snapshot)} frame(s).")
 
-    def _on_correction_saved(self) -> None:
+    # ── Correction persistence (overwrite primary_aoi in place + auto-save) ─────
+    def _schedule_autosave(self) -> None:
+        """Debounced auto-save so corrections are always on disk (no data loss)."""
+        self._autosave_timer.start(500)
+
+    def _save_corrections_to_disk(self, silent: bool = True) -> None:
         if not self._rec_dir or not self._edit_labels:
             return
-            
         csv_path = self._rec_dir / "aoi_results" / "raw" / "analysis.csv"
         if not csv_path.exists():
-            QMessageBox.warning(self, APP_TITLE, "analysis.csv not found.")
+            csv_path = self._rec_dir / "aoi_results" / "analysis.csv"
+        if not csv_path.exists():
+            if not silent:
+                QMessageBox.warning(self, APP_TITLE, "analysis.csv not found.")
             return
-            
         try:
-            import pandas as pd
             df = pd.read_csv(csv_path)
-            
-            # Apply all manual corrections to the DataFrame. Write BOTH primary_aoi
-            # and final_primary_aoi so the dashboard (which prefers final_primary_aoi)
-            # reflects the correction.
-            if "final_primary_aoi" not in df.columns:
-                df["final_primary_aoi"] = df["primary_aoi"]
-            changes_made = 0
-            for i, (lbl, src) in enumerate(zip(self._edit_labels, self._edit_sources)):
-                if src == "manual" and i < len(df):
-                    df.at[i, "primary_aoi"] = lbl
-                    df.at[i, "final_primary_aoi"] = lbl
-                    df.at[i, "aoi_hit_source"] = "manual"
-                    changes_made += 1
-
-            if changes_made > 0:
-                df['aoi_transition'] = df['final_primary_aoi'].ne(df['final_primary_aoi'].shift()) & df['final_primary_aoi'].notna()
-                df.to_csv(csv_path, index=False)
-                self._status_lbl.setText(f"Saved {changes_made} corrections to analysis.csv")
-                self._correction_panel._save_btn.setText("Saved ✓")
-                QTimer.singleShot(1500, lambda: self._correction_panel._save_btn.setText("Save"))
-                self._dashboard.reload()   # keep the dashboard in sync with the edit
+            # Rows are positioned by absolute frame_idx, so map edited frames to the
+            # correct rows (robust to trimmed/cropped CSVs).
+            if "frame_idx" in df.columns:
+                fi = pd.to_numeric(df["frame_idx"], errors="coerce").fillna(-1).astype(int)
+                pos = {f: r for r, f in enumerate(fi.tolist())}
             else:
-                self._status_lbl.setText("No manual corrections to save.")
-                
+                pos = {i: i for i in range(len(df))}
+            changes = 0
+            for f, (lbl, src) in enumerate(zip(self._edit_labels, self._edit_sources)):
+                if src == "manual" and f in pos:
+                    df.at[pos[f], "primary_aoi"] = lbl
+                    if "aoi_hit_source" in df.columns:
+                        df.at[pos[f], "aoi_hit_source"] = "manual"
+                    changes += 1
+            # Single source of truth is primary_aoi — drop any legacy correction column.
+            if "final_primary_aoi" in df.columns:
+                df = df.drop(columns=["final_primary_aoi"])
+            if "aoi_transition" in df.columns:
+                df["aoi_transition"] = df["primary_aoi"].ne(df["primary_aoi"].shift()) & df["primary_aoi"].notna()
+            df.to_csv(csv_path, index=False)
+            self._dashboard.reload()
+            if not silent:
+                self._status_lbl.setText(f"Saved {changes} correction(s) to analysis.csv")
+                self._correction_panel._save_btn.setText("Saved ✓")
+                QTimer.singleShot(1200, lambda: self._correction_panel._save_btn.setText("Save"))
         except Exception as e:
-            QMessageBox.critical(self, APP_TITLE, f"Failed to save corrections: {e}")
+            if not silent:
+                QMessageBox.critical(self, APP_TITLE, f"Failed to save corrections: {e}")
+
+    def _on_correction_saved(self) -> None:
+        # Save button = force an immediate (non-silent) save.
+        self._save_corrections_to_disk(silent=False)
 
     def _run_analysis(self) -> None:
         if self._rec_dir is None:
@@ -4069,6 +4099,7 @@ class MainWindow(QMainWindow):
             return
         self._analyze_btn.setEnabled(True)
         self._progress_bar.hide()
+        self._flush_autosave()   # never let a reload clobber unsaved corrections
         self._load_analysis_if_ready()
         self._load_quality()
         self._refresh_recordings()   # update 🟢/⚪ status dots
@@ -4402,6 +4433,9 @@ class MainWindow(QMainWindow):
             "O — Mark end of selected task at current frame<br>"
             "<br><b>AOI Correction</b><br>"
             "Choose an AOI, then Frame for one frame, or mark In/Out and Apply for a range<br>"
+            "F — Apply AOI to current frame<br>"
+            "J — Range In &nbsp;·&nbsp; K — Range Out &nbsp;·&nbsp; L — Apply range<br>"
+            "(corrections auto-save to analysis.csv)<br>"
             "<br><b>Trim</b><br>"
             "In / Out buttons — Mark the analysis range at the current frame<br>"
             "Clear — Remove trim, analyse the full recording"
