@@ -1599,6 +1599,7 @@ class DashboardWidget(QWidget):
         self._pop_heatmap_tab(dft)
         self._pop_transition_tab(dft)
         self._pop_learning_tab(rec_dir, fps, task_filter)
+        self._pop_errors_tab(rec_dir)
 
     @staticmethod
     def _load_task_bounds(rec_dir: pathlib.Path, task_filter: str) -> tuple | None:
@@ -2005,6 +2006,77 @@ td{{border-bottom:1px solid rgba(255,255,255,.04)}}
             showlegend=False, margin=dict(t=50, b=40))
         view.setHtml(self._fig_to_html(fig))
 
+    # ── Tab 7: Assembly Errors ────────────────────────────────────────────────
+
+    def _render_error_fig(self, view, series: dict, title: str) -> None:
+        tasks = sorted(series.keys())
+        ct = [series[t]["comp_type"]  for t in tasks]
+        cp = [series[t]["comp_pos"]   for t in tasks]
+        kt = [series[t]["cable_type"] for t in tasks]
+        kp = [series[t]["cable_pos"]  for t in tasks]
+        comp_tot  = [ct[i] + cp[i] for i in range(len(tasks))]
+        cable_tot = [kt[i] + kp[i] for i in range(len(tasks))]
+        fig = go.Figure()
+
+        def add(name, y, color):
+            fig.add_trace(go.Scatter(x=tasks, y=y, mode="lines+markers",
+                                     name=name, line=dict(color=color)))
+        # trace order: 0 CompType 1 CompPos 2 CableType 3 CablePos 4 CompTot 5 CableTot
+        add("Component · Type", ct, "#d4a24a")
+        add("Component · Position", cp, "#6fae7d")
+        add("Cable · Type", kt, "#c07ba8")
+        add("Cable · Position", kp, "#6e8fd6")
+        add("Components (total)", comp_tot, "#d4a24a")
+        add("Cables (total)", cable_tot, "#6e8fd6")
+        views = {
+            "Components": [True, True, False, False, False, False],
+            "Cables":     [False, False, True, True, False, False],
+            "All / Both": [False, False, False, False, True, True],
+        }
+        for i, tr in enumerate(fig.data):
+            tr.visible = views["All / Both"][i]
+        buttons = [dict(label=k, method="update",
+                        args=[{"visible": v}, {"title.text": f"{title} — {k}"}])
+                   for k, v in views.items()]
+        fig.update_layout(
+            title=f"{title} — All / Both",
+            template="aoi_studio", autosize=True,
+            xaxis=dict(title="Task", dtick=1), yaxis_title="Error count",
+            updatemenus=[dict(type="buttons", direction="right",
+                              x=0.0, y=1.18, xanchor="left", active=2, buttons=buttons)],
+            margin=dict(t=80, b=40))
+        view.setHtml(self._fig_to_html(fig))
+
+    def _pop_errors_tab(self, rec_dir: pathlib.Path) -> None:
+        view = self._rec_tab_views["errors"]
+        series = _error_series(_load_errors_json(rec_dir))
+        if not series or all(sum(v.values()) == 0 for v in series.values()):
+            view.setHtml(self._no_data_html(
+                "No errors entered yet.<br>Fill the ERRORS section in the Studio tab."))
+            return
+        self._render_error_fig(view, series, "Errors per Task")
+
+    def _pop_agg_errors_tab(self, csvs: list[tuple[str, pathlib.Path]]) -> None:
+        view = self._agg_tab_views["errors"]
+        acc: dict[int, dict[str, list]] = {}
+        n = 0
+        for _rec, csv_path in csvs:
+            series = _error_series(_load_errors_json(self._rec_dir_from_csv(csv_path)))
+            if not series:
+                continue
+            n += 1
+            for t, v in series.items():
+                d = acc.setdefault(t, {"comp_type": [], "comp_pos": [], "cable_type": [], "cable_pos": []})
+                for k in d:
+                    d[k].append(v[k])
+        if not acc:
+            view.setHtml(self._no_data_html(
+                "No errors entered for these recordings.<br>Fill the ERRORS section per recording."))
+            return
+        mean_series = {t: {k: (sum(vals) / len(vals) if vals else 0.0) for k, vals in d.items()}
+                       for t, d in acc.items()}
+        self._render_error_fig(view, mean_series, f"Mean errors per Task — {n} recording(s)")
+
     # ── Aggregate (multi-recording) tab population ────────────────────────────
 
     @staticmethod
@@ -2036,6 +2108,8 @@ td{{border-bottom:1px solid rgba(255,255,255,.04)}}
         self._pop_agg_transition_tab(csvs, task_filter)
         QApplication.processEvents()
         self._pop_agg_learning_tab(csvs, task_filter)
+        QApplication.processEvents()
+        self._pop_agg_errors_tab(csvs)
 
     # ── Aggregate Tab 1: Data Quality ─────────────────────────────────────────
 
@@ -2848,7 +2922,37 @@ _REC_TAB_DEFS = [
     ("heatmaps",     "AOI Heatmaps"),
     ("transitions",  "Transition Matrix"),
     ("learning",     "Learning Curve"),
+    ("errors",       "Errors"),
 ]
+
+# Roll-up of the 5 manual error fields into the graph's Type / Position axes.
+#   Type     = wrong identity  (component Type / cable Colour)
+#   Position = wrong placement (component Number+Orientation / cable Hole)
+def _error_series(errs: dict) -> dict:
+    """errs = {task_name: {field: count}} -> per task_idx sums for each series."""
+    out: dict[int, dict[str, float]] = {}
+    for tname, v in (errs or {}).items():
+        digits = "".join(c for c in str(tname) if c.isdigit())
+        if not digits:
+            continue
+        ti = int(digits)
+        g = out.setdefault(ti, {"comp_type": 0, "comp_pos": 0, "cable_type": 0, "cable_pos": 0})
+        g["comp_type"]  += float(v.get("comp_type", 0) or 0)
+        g["comp_pos"]   += float(v.get("comp_number", 0) or 0) + float(v.get("comp_orientation", 0) or 0)
+        g["cable_type"] += float(v.get("cable_colour", 0) or 0)
+        g["cable_pos"]  += float(v.get("cable_position", 0) or 0)
+    return out
+
+
+def _load_errors_json(rec_dir: pathlib.Path) -> dict:
+    for p in [rec_dir / "aoi_results" / "errors.json",
+              rec_dir / "aoi_results" / "raw" / "errors.json"]:
+        if p.exists():
+            try:
+                return json.loads(p.read_text(encoding="utf-8"))
+            except Exception:
+                return {}
+    return {}
 
 _TAB_DEFS = [
     ("01_dwell_pct",          "Dwell %"),
@@ -3458,6 +3562,94 @@ class CollapsibleBox(QWidget):
         self.content_layout.addWidget(widget, stretch)
 
 
+# Manual assembly-error entry (filled by hand from the board photos, per task).
+ERROR_FIELDS = [
+    ("comp_number",      "Number / Gap"),
+    ("comp_type",        "Type"),
+    ("comp_orientation", "Orientation"),
+    ("cable_position",   "Position"),
+    ("cable_colour",     "Colour"),
+]
+
+
+class ErrorPanel(QWidget):
+    """Per-task assembly error counts (Components + Cables), entered manually."""
+    errorsChanged = Signal()
+    N_TASKS = 10
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._data = {f"Task {i}": {k: 0 for k, _ in ERROR_FIELDS}
+                      for i in range(1, self.N_TASKS + 1)}
+        self._current = "Task 1"
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(6)
+
+        row = QHBoxLayout(); row.setSpacing(6)
+        row.addWidget(QLabel("Task:"))
+        self._task_combo = QComboBox()
+        self._task_combo.addItems([f"Task {i}" for i in range(1, self.N_TASKS + 1)])
+        row.addWidget(self._task_combo, 1)
+        lay.addLayout(row)
+
+        self._spins: dict[str, QSpinBox] = {}
+
+        def section(title: str, keys: list[tuple[str, str]]) -> None:
+            t = QLabel(title); t.setObjectName("sectionTitle"); lay.addWidget(t)
+            for key, label in keys:
+                r = QHBoxLayout(); r.setSpacing(6)
+                lbl = QLabel(label)
+                lbl.setStyleSheet(f"font-size: 12px; color: {Theme.TEXT_MUTED};")
+                sp = QSpinBox(); sp.setRange(0, 999); sp.setFixedWidth(64)
+                sp.valueChanged.connect(self._on_value_changed)
+                r.addWidget(lbl, 1); r.addWidget(sp)
+                lay.addLayout(r)
+                self._spins[key] = sp
+
+        section("COMPONENTS", ERROR_FIELDS[:3])
+        section("CABLES", ERROR_FIELDS[3:])
+
+        self._task_combo.currentTextChanged.connect(self._on_task_changed)
+        self._refresh_spins()
+
+    def _on_task_changed(self, task: str) -> None:
+        self._current = task
+        self._refresh_spins()
+
+    def _refresh_spins(self) -> None:
+        vals = self._data.get(self._current, {})
+        for k, sp in self._spins.items():
+            sp.blockSignals(True)
+            sp.setValue(int(vals.get(k, 0)))
+            sp.blockSignals(False)
+
+    def _on_value_changed(self, _v: int) -> None:
+        d = self._data.setdefault(self._current, {k: 0 for k, _ in ERROR_FIELDS})
+        for k, sp in self._spins.items():
+            d[k] = sp.value()
+        self.errorsChanged.emit()
+
+    def get_errors(self) -> dict:
+        return {t: dict(v) for t, v in self._data.items()}
+
+    def load(self, data: dict) -> None:
+        if isinstance(data, dict):
+            for t, v in data.items():
+                if t in self._data and isinstance(v, dict):
+                    for k in self._data[t]:
+                        try:
+                            self._data[t][k] = int(v.get(k, 0) or 0)
+                        except (TypeError, ValueError):
+                            self._data[t][k] = 0
+        self._refresh_spins()
+
+    def reset(self) -> None:
+        self._data = {f"Task {i}": {k: 0 for k, _ in ERROR_FIELDS}
+                      for i in range(1, self.N_TASKS + 1)}
+        self._refresh_spins()
+
+
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -3654,8 +3846,14 @@ class MainWindow(QMainWindow):
         self._task_box.addWidget(task_scroll, 1)
         left_layout.addWidget(self._task_box)
 
+        # ── Assembly errors (manual entry from board photos) ──
+        self._error_box = CollapsibleBox("ERRORS")
+        self._error_panel = ErrorPanel()
+        self._error_box.addWidget(self._error_panel)
+        left_layout.addWidget(self._error_box)
+
         # Collapsible sections stack from the top; slack goes to the bottom so a
-        # collapsed section doesn't leave a big gap. (Errors section added later.)
+        # collapsed section doesn't leave a big gap.
         left_layout.addStretch(1)
         # Save + Export now live in the top-right corner (created above).
 
@@ -3739,6 +3937,7 @@ class MainWindow(QMainWindow):
         self._correction_panel.correctionApplied.connect(self._on_correction_applied)
         self._correction_panel.correctionSaved.connect(self._on_correction_saved)
         self._correction_panel.undoRequested.connect(self._undo_correction)
+        self._error_panel.errorsChanged.connect(self._save_errors)
 
         # Shortcuts
         for key, fn in [
@@ -3873,11 +4072,12 @@ class MainWindow(QMainWindow):
             self._trim_panel.reset()
             self._trim = self._trim_panel.get_trim()
 
-            # Load existing analysis / tasks / trim / quality if available
+            # Load existing analysis / tasks / trim / quality / errors if available
             self._load_analysis_if_ready()
             self._load_tasks_from_disk()
             self._load_trim_from_disk()
             self._load_quality()
+            self._load_errors_from_disk()
 
             self._analyze_btn.setEnabled(True)
             self._save_tasks_btn.setEnabled(True)
@@ -4393,6 +4593,28 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, APP_TITLE, f"Cropped data from {original_len} to {len(df)} frames. Dashboard updated.")
         except Exception as e:
             QMessageBox.critical(self, APP_TITLE, f"Failed to crop data: {e}")
+
+    def _save_errors(self) -> None:
+        if self._rec_dir is None:
+            return
+        out = self._rec_dir / "aoi_results"
+        out.mkdir(parents=True, exist_ok=True)
+        (out / "errors.json").write_text(
+            json.dumps(self._error_panel.get_errors(), indent=2), encoding="utf-8")
+        self._dashboard.reload()
+
+    def _load_errors_from_disk(self) -> None:
+        self._error_panel.reset()
+        if self._rec_dir is None:
+            return
+        for p in [self._rec_dir / "aoi_results" / "errors.json",
+                  self._rec_dir / "aoi_results" / "raw" / "errors.json"]:
+            if p.exists():
+                try:
+                    self._error_panel.load(json.loads(p.read_text(encoding="utf-8")))
+                except Exception:
+                    pass
+                return
 
     def _load_trim_from_disk(self) -> None:
         if self._rec_dir is None:
