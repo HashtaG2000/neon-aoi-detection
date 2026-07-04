@@ -3428,20 +3428,24 @@ class CollapsibleBox(QWidget):
             }}
         """)
         # Arrow in the text shows state: ▼ Title (open) / ▶ Title (collapsed).
+        # Sections start COLLAPSED — open only what you need.
         self._title = title
-        self.toggle_button.setText(f"▼  {self._title}")
+        self.toggle_button.setText(f"▶  {self._title}")
         self.toggle_button.clicked.connect(self.on_pressed)
 
         self.content_area = QWidget()
         self.content_layout = QVBoxLayout(self.content_area)
         self.content_layout.setContentsMargins(0, 8, 0, 8)
         self.content_layout.setSpacing(10)
+        self.content_area.setVisible(False)
 
         main_layout = QVBoxLayout(self)
         main_layout.setSpacing(0)
         main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.addWidget(self.toggle_button)
         main_layout.addWidget(self.content_area)
+        # Don't reserve vertical space when collapsed.
+        self.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
 
     def on_pressed(self):
         # Toggle: if currently hidden, show it; if currently shown, hide it.
@@ -3488,6 +3492,10 @@ class MainWindow(QMainWindow):
         self._autosave_timer = QTimer(self)
         self._autosave_timer.setSingleShot(True)
         self._autosave_timer.timeout.connect(lambda: self._save_corrections_to_disk(silent=True))
+
+        # Polls progress.json during analysis to fill the Analyse button.
+        self._progress_timer = QTimer(self)
+        self._progress_timer.timeout.connect(self._poll_analysis)
 
         # State variables for new logic
         self._trim: dict[str, Any] = {}
@@ -3586,8 +3594,8 @@ class MainWindow(QMainWindow):
         # Filter the recording list by analysis status (🟢 analysed / ⚪ pending).
         self._rec_filter_combo = QComboBox()
         self._rec_filter_combo.addItem("All recordings", "all")
-        self._rec_filter_combo.addItem("🟢  Analysed", "done")
-        self._rec_filter_combo.addItem("⚪  Pending", "pending")
+        self._rec_filter_combo.addItem("● Analysed", "done")
+        self._rec_filter_combo.addItem("○ Pending", "pending")
         self._rec_filter_combo.setToolTip("Show all recordings, only analysed, or only those still needing analysis")
         left_layout.addWidget(self._rec_filter_combo)
 
@@ -3604,25 +3612,18 @@ class MainWindow(QMainWindow):
         left_layout.addWidget(self._analyze_btn)
 
 
+        # Progress is shown ON the Analyse button (fills as it processes), not a
+        # separate bar. Kept for compatibility but not placed in the panel.
         self._progress_bar = QProgressBar()
         self._progress_bar.setRange(0, 100)
-        self._progress_bar.setValue(0)
-        self._progress_bar.setTextVisible(True)
         self._progress_bar.hide()
-        left_layout.addWidget(self._progress_bar)
 
+        # Status lives in the window's bottom status bar, not as a panel info box.
         self._status_lbl = QLabel("No recording loaded.")
-        self._status_lbl.setObjectName("statusLabel")
-        self._status_lbl.setWordWrap(True)
-        left_layout.addWidget(self._status_lbl)
-
-        self._quality_lbl = QLabel("")
-        self._quality_lbl.setWordWrap(True)
-        self._quality_lbl.setStyleSheet(
-            "font-size: 10px; border-radius: 4px; padding: 4px 6px;"
-        )
+        self.statusBar().addWidget(self._status_lbl, 1)
+        self._quality_lbl = QLabel("")   # data-quality note (right of the status bar)
+        self.statusBar().addPermanentWidget(self._quality_lbl)
         self._quality_lbl.hide()
-        left_layout.addWidget(self._quality_lbl)
 
         _div1 = QFrame(); _div1.setFrameShape(QFrame.HLine); _div1.setObjectName("divider")
         left_layout.addWidget(_div1)
@@ -3649,9 +3650,13 @@ class MainWindow(QMainWindow):
         task_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         task_scroll.setStyleSheet("QScrollArea { border: none; background: transparent; }")
         task_scroll.setWidget(self._task_panel)
+        task_scroll.setMinimumHeight(200)   # visible when the section is expanded
         self._task_box.addWidget(task_scroll, 1)
+        left_layout.addWidget(self._task_box)
 
-        left_layout.addWidget(self._task_box, 1)
+        # Collapsible sections stack from the top; slack goes to the bottom so a
+        # collapsed section doesn't leave a big gap. (Errors section added later.)
+        left_layout.addStretch(1)
         # Save + Export now live in the top-right corner (created above).
 
         # Right: video + controls, and timeline — split so the timeline's
@@ -3790,7 +3795,11 @@ class MainWindow(QMainWindow):
                     continue
                 if flt == "pending" and done:
                     continue
-                self._rec_combo.addItem(f"{'🟢' if done else '⚪'}  {d.name}", userData=d)
+                self._rec_combo.addItem(f"{'●' if done else '○'}  {d.name}", userData=d)
+                self._rec_combo.setItemData(
+                    self._rec_combo.count() - 1,
+                    QColor("#6fae7d") if done else QColor("#6a6d73"),
+                    Qt.ForegroundRole)
         if prev is not None:                       # keep the current selection
             for i in range(self._rec_combo.count()):
                 if self._rec_combo.itemData(i) == prev:
@@ -3874,9 +3883,8 @@ class MainWindow(QMainWindow):
             self._save_tasks_btn.setEnabled(True)
             dur = n / self._fps
             self._status_lbl.setText(
-                f"{rec_dir.name}\n{n} frames  ·  "
-                f"{int(dur//3600)}:{int(dur%3600//60):02d}:{int(dur%60):02d}  ·  "
-                f"{self._fps:.0f} fps"
+                f"{rec_dir.name}  ·  {n} frames  ·  "
+                f"{int(dur//3600)}:{int(dur%3600//60):02d}:{int(dur%60):02d}  ·  {self._fps:.0f} fps"
             )
         except Exception as exc:
             self._status_lbl.setText(f"Load error: {exc}")
@@ -4015,9 +4023,8 @@ class MainWindow(QMainWindow):
             lock = self._rec_dir / "aoi_results" / "raw" / ".processing"
             lock.unlink(missing_ok=True)
 
-        self._analyze_btn.setEnabled(False)
-        self._progress_bar.setValue(0)
-        self._progress_bar.show()
+        self._set_analyse_progress(0)
+        self._progress_timer.start(300)
         self._status_lbl.setText("Analysis running…")
 
         self._analysis_generation += 1
@@ -4081,36 +4088,57 @@ class MainWindow(QMainWindow):
         self._status_lbl.setText("Batch analysis failed.")
         QMessageBox.warning(self, APP_TITLE, f"Batch analysis failed:\n{msg}")
 
+    def _set_analyse_progress(self, pct: Optional[int]) -> None:
+        """Show analysis progress by filling the Analyse button; None = idle reset."""
+        if pct is None:
+            self._analyze_btn.setStyleSheet("")   # revert to global primaryButton style
+            self._analyze_btn.setText("  Analyse")
+            return
+        pct = max(0, min(100, int(pct)))
+        self._analyze_btn.setText(f"  Analysing… {pct}%")
+        s = pct / 100.0
+        e = min(s + 0.0001, 1.0)
+        self._analyze_btn.setStyleSheet(
+            "QPushButton {"
+            f" background: qlineargradient(x1:0, y1:0, x2:1, y2:0,"
+            f" stop:0 #7e9bdb, stop:{s:.4f} #7e9bdb,"
+            f" stop:{e:.4f} #333f5c, stop:1 #333f5c);"
+            " color:#ffffff; border:1px solid #6e8fd6; border-radius:8px;"
+            " padding:8px 12px; font-weight:600; }"
+        )
+
     def _poll_analysis(self) -> None:
         if self._rec_dir is None:
             return
-        progress_path = self._rec_dir / "aoi_results" / "raw" / "progress.json"
-        if progress_path.exists():
-            try:
-                data = json.loads(progress_path.read_text(encoding="utf-8"))
-                pct  = int(data.get("percent", 0))
-                self._progress_bar.setValue(pct)
-                self._progress_bar.show()
-            except Exception:
-                pass
+        for progress_path in (self._rec_dir / "aoi_results" / "raw" / "progress.json",
+                              self._rec_dir / "aoi_results" / "progress.json"):
+            if progress_path.exists():
+                try:
+                    data = json.loads(progress_path.read_text(encoding="utf-8"))
+                    self._set_analyse_progress(int(data.get("percent", 0)))
+                except Exception:
+                    pass
+                return
 
     def _on_analysis_done(self, generation: int) -> None:
         if generation != self._analysis_generation:
             return
+        self._progress_timer.stop()
+        self._set_analyse_progress(None)
         self._analyze_btn.setEnabled(True)
-        self._progress_bar.hide()
         self._flush_autosave()   # never let a reload clobber unsaved corrections
         self._load_analysis_if_ready()
         self._load_quality()
-        self._refresh_recordings()   # update 🟢/⚪ status dots
+        self._refresh_recordings()   # update ●/○ status dots
         self._dashboard.reload()     # keep dashboard in sync with the new analysis
         self._status_lbl.setText("Analysis complete.")
 
     def _on_analysis_failed(self, msg: str, generation: int) -> None:
         if generation != self._analysis_generation:
             return
+        self._progress_timer.stop()
+        self._set_analyse_progress(None)
         self._analyze_btn.setEnabled(True)
-        self._progress_bar.hide()
         self._status_lbl.setText(f"Analysis failed.")
         QMessageBox.warning(self, APP_TITLE, f"Analysis failed:\n{msg}")
 
