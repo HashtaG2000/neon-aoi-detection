@@ -1645,7 +1645,6 @@ class DashboardWidget(QWidget):
         self._pop_heatmap_tab(dft)
         self._pop_transition_tab(dft)
         self._pop_learning_tab(rec_dir, fps, task_filter)
-        self._pop_errors_tab(rec_dir)
 
     @staticmethod
     def _load_task_bounds(rec_dir: pathlib.Path, task_filter: str) -> tuple | None:
@@ -2021,107 +2020,89 @@ td{{border-bottom:1px solid rgba(255,255,255,.04)}}
             view.setHtml(self._no_data_html(f"No data for filter: {task_filter}"))
             return
 
-        fig = go.Figure()
+        # Errors render as a second panel DIRECTLY under the learning curve, sharing
+        # the Task 1-10 x-axis so repetitions line up vertically.
+        series = _error_series(_load_errors_json(rec_dir))
+        has_err = self._has_errors(series)
+        if has_err:
+            fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.13,
+                                row_heights=[0.55, 0.45],
+                                subplot_titles=("Learning Curve — Task Duration",
+                                                "Assembly Errors per Task"))
+        else:
+            fig = make_subplots(rows=1, cols=1)
         fig.add_trace(go.Scatter(
-            x=tdf["task_idx"], y=tdf["dur_s"],
-            mode="lines+markers",
-            line=dict(width=2, color="#6e8fd6"),
-            marker=dict(size=8, color="#6e8fd6"),
-            customdata=tdf["task"].values,
+            x=tdf["task_idx"], y=tdf["dur_s"], mode="lines+markers",
+            line=dict(width=2, color="#6e8fd6"), marker=dict(size=8, color="#6e8fd6"),
+            customdata=tdf["task"].values, showlegend=False,
             hovertemplate="<b>%{customdata}</b><br>Duration: %{y:.1f}s<extra></extra>",
-        ))
-        # Trend line
+        ), row=1, col=1)
         if len(tdf) > 2:
             z = np.polyfit(tdf["task_idx"].values, tdf["dur_s"].values, 1)
             xr = np.linspace(tdf["task_idx"].min(), tdf["task_idx"].max(), 50)
-            fig.add_trace(go.Scatter(
-                x=xr, y=np.poly1d(z)(xr),
-                mode="lines",
+            fig.add_trace(go.Scatter(x=xr, y=np.poly1d(z)(xr), mode="lines",
                 line=dict(width=1.5, dash="dash", color="#333"),
-                showlegend=False, hoverinfo="skip",
-            ))
+                showlegend=False, hoverinfo="skip"), row=1, col=1)
         mean_dur = tdf["dur_s"].mean()
         fig.add_hline(y=mean_dur, line_dash="dot", line_color="#555",
                       annotation_text=f"Mean {mean_dur:.1f}s",
-                      annotation_position="bottom right")
-        fig.update_layout(
-            title="Learning Curve — Task Duration per Repetition",
-            xaxis=dict(title="Repetition", dtick=1),
-            yaxis_title="Duration (s)",
-            template="aoi_studio", autosize=True,
-            showlegend=False, margin=dict(t=50, b=40))
+                      annotation_position="bottom right", row=1, col=1)
+        fig.update_yaxes(title_text="Duration (s)", row=1, col=1)
+        layout = dict(template="aoi_studio", autosize=True, margin=dict(t=60, b=40))
+        if has_err:
+            buttons = self._add_error_traces(fig, series, row=2, n_prefix=len(fig.data))
+            fig.update_xaxes(title_text="Task", dtick=1, row=2, col=1)
+            fig.update_yaxes(title_text="Error count", row=2, col=1)
+            layout["updatemenus"] = [dict(type="buttons", direction="right", x=0.0, y=1.10,
+                                          xanchor="left", active=2, buttons=buttons)]
+            layout["height"] = 640
+        else:
+            fig.update_xaxes(title_text="Repetition", dtick=1, row=1, col=1)
+            fig.update_layout(title="Learning Curve — Task Duration per Repetition")
+        fig.update_layout(**layout)
         view.setHtml(self._fig_to_html(fig))
 
-    # ── Tab 7: Assembly Errors ────────────────────────────────────────────────
+    # ── Assembly-error traces (rendered UNDER the learning curve) ─────────────
 
-    def _render_error_fig(self, view, series: dict, title: str) -> None:
-        tasks = sorted(series.keys())
-        ct = [series[t]["comp_type"]  for t in tasks]
-        cp = [series[t]["comp_pos"]   for t in tasks]
-        kt = [series[t]["cable_type"] for t in tasks]
-        kp = [series[t]["cable_pos"]  for t in tasks]
-        comp_tot  = [ct[i] + cp[i] for i in range(len(tasks))]
-        cable_tot = [kt[i] + kp[i] for i in range(len(tasks))]
-        fig = go.Figure()
+    @staticmethod
+    def _has_errors(series: dict) -> bool:
+        return bool(series) and not all(sum(v.values()) == 0 for v in series.values())
 
-        def add(name, y, color):
-            fig.add_trace(go.Scatter(x=tasks, y=y, mode="lines+markers",
-                                     name=name, line=dict(color=color)))
-        # trace order: 0 CompType 1 CompPos 2 CableType 3 CablePos 4 CompTot 5 CableTot
-        add("Component · Type", ct, "#d4a24a")
-        add("Component · Position", cp, "#6fae7d")
-        add("Cable · Type", kt, "#c07ba8")
-        add("Cable · Position", kp, "#6e8fd6")
-        add("Components (total)", comp_tot, "#d4a24a")
-        add("Cables (total)", cable_tot, "#6e8fd6")
-        views = {
-            "Components": [True, True, False, False, False, False],
-            "Cables":     [False, False, True, True, False, False],
-            "All / Both": [False, False, False, False, True, True],
-        }
-        for i, tr in enumerate(fig.data):
-            tr.visible = views["All / Both"][i]
-        buttons = [dict(label=k, method="update",
-                        args=[{"visible": v}, {"title.text": f"{title} — {k}"}])
-                   for k, v in views.items()]
-        fig.update_layout(
-            title=f"{title} — All / Both",
-            template="aoi_studio", autosize=True,
-            xaxis=dict(title="Task", dtick=1), yaxis_title="Error count",
-            updatemenus=[dict(type="buttons", direction="right",
-                              x=0.0, y=1.18, xanchor="left", active=2, buttons=buttons)],
-            margin=dict(t=80, b=40))
-        view.setHtml(self._fig_to_html(fig))
-
-    def _pop_errors_tab(self, rec_dir: pathlib.Path) -> None:
-        view = self._rec_tab_views["errors"]
-        series = _error_series(_load_errors_json(rec_dir))
-        if not series or all(sum(v.values()) == 0 for v in series.values()):
-            view.setHtml(self._no_data_html(
-                "No errors entered yet.<br>Fill the ERRORS section in the Studio tab."))
-            return
-        self._render_error_fig(view, series, "Errors per Task")
-
-    def _pop_agg_errors_tab(self, csvs: list[tuple[str, pathlib.Path]]) -> None:
-        view = self._agg_tab_views["errors"]
+    def _agg_error_series(self, csvs: list[tuple[str, pathlib.Path]]) -> dict:
+        """Mean per-task error series across the given recordings."""
         acc: dict[int, dict[str, list]] = {}
-        n = 0
         for _rec, csv_path in csvs:
             series = _error_series(_load_errors_json(self._rec_dir_from_csv(csv_path)))
-            if not series:
-                continue
-            n += 1
             for t, v in series.items():
                 d = acc.setdefault(t, {"comp_type": [], "comp_pos": [], "cable_type": [], "cable_pos": []})
                 for k in d:
                     d[k].append(v[k])
-        if not acc:
-            view.setHtml(self._no_data_html(
-                "No errors entered for these recordings.<br>Fill the ERRORS section per recording."))
-            return
-        mean_series = {t: {k: (sum(vals) / len(vals) if vals else 0.0) for k, vals in d.items()}
-                       for t, d in acc.items()}
-        self._render_error_fig(view, mean_series, f"Mean errors per Task — {n} recording(s)")
+        return {t: {k: (sum(vals) / len(vals) if vals else 0.0) for k, vals in d.items()}
+                for t, d in acc.items()}
+
+    def _add_error_traces(self, fig, series: dict, row: int, n_prefix: int) -> list:
+        """Add the 6 error traces to `fig` at `row`; return the Components/Cables/
+        All-Both toggle buttons (learning traces at indices <n_prefix stay visible)."""
+        tasks = sorted(series.keys())
+        ct = [series[t]["comp_type"] for t in tasks]
+        cp = [series[t]["comp_pos"] for t in tasks]
+        kt = [series[t]["cable_type"] for t in tasks]
+        kp = [series[t]["cable_pos"] for t in tasks]
+        comp_tot = [ct[i] + cp[i] for i in range(len(tasks))]
+        cable_tot = [kt[i] + kp[i] for i in range(len(tasks))]
+        specs = [("Component · Type", ct, "#d4a24a"), ("Component · Position", cp, "#6fae7d"),
+                 ("Cable · Type", kt, "#c07ba8"), ("Cable · Position", kp, "#6e8fd6"),
+                 ("Components (total)", comp_tot, "#d4a24a"), ("Cables (total)", cable_tot, "#6e8fd6")]
+        for name, y, color in specs:
+            fig.add_trace(go.Scatter(x=tasks, y=y, mode="lines+markers", name=name,
+                                     line=dict(color=color), showlegend=True), row=row, col=1)
+        views = {"Components": [True, True, False, False, False, False],
+                 "Cables":     [False, False, True, True, False, False],
+                 "All / Both": [False, False, False, False, True, True]}
+        for i in range(6):
+            fig.data[n_prefix + i].visible = views["All / Both"][i]
+        return [dict(label=k, method="restyle", args=[{"visible": [True] * n_prefix + v}])
+                for k, v in views.items()]
 
     # ── Aggregate (multi-recording) tab population ────────────────────────────
 
@@ -2154,8 +2135,6 @@ td{{border-bottom:1px solid rgba(255,255,255,.04)}}
         self._pop_agg_transition_tab(csvs, task_filter)
         QApplication.processEvents()
         self._pop_agg_learning_tab(csvs, task_filter)
-        QApplication.processEvents()
-        self._pop_agg_errors_tab(csvs)
 
     # ── Aggregate Tab 1: Data Quality ─────────────────────────────────────────
 
@@ -2546,7 +2525,15 @@ td{{border-bottom:1px solid rgba(255,255,255,.04)}}
                .agg(mean="mean", std="std", median="median", n="count")
                .reset_index().sort_values("task_idx"))
         agg["std"] = agg["std"].fillna(0)
-        fig = go.Figure()
+        agg_err = self._agg_error_series(csvs)
+        has_err = self._has_errors(agg_err)
+        if has_err:
+            fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.13,
+                                row_heights=[0.55, 0.45],
+                                subplot_titles=(f"Learning Curve — {n_recs} recording(s)",
+                                                "Mean Assembly Errors per Task"))
+        else:
+            fig = make_subplots(rows=1, cols=1)
         if n_recs > 1:
             x_l = agg["task_idx"].tolist()
             fig.add_trace(go.Scatter(
@@ -2556,36 +2543,36 @@ td{{border-bottom:1px solid rgba(255,255,255,.04)}}
                 fill="toself", fillcolor="rgba(88,166,255,0.12)",
                 line=dict(color="rgba(0,0,0,0)"),
                 showlegend=False, hoverinfo="skip",
-            ))
+            ), row=1, col=1)
             for rn, rg in tdf.groupby("recording"):
                 rg = rg.sort_values("task_idx")
                 fig.add_trace(go.Scatter(
-                    x=rg["task_idx"], y=rg["dur_s"],
-                    mode="lines+markers",
-                    line=dict(width=1, color="#3a3d43"),
-                    marker=dict(size=4),
+                    x=rg["task_idx"], y=rg["dur_s"], mode="lines+markers",
+                    line=dict(width=1, color="#3a3d43"), marker=dict(size=4),
                     name=rn, showlegend=False,
-                ))
+                ), row=1, col=1)
         fig.add_trace(go.Scatter(
-            x=agg["task_idx"], y=agg["mean"],
-            mode="lines+markers",
-            line=dict(width=3, color="#6e8fd6"),
-            marker=dict(size=8, color="#6e8fd6"),
-            name="Mean",
+            x=agg["task_idx"], y=agg["mean"], mode="lines+markers",
+            line=dict(width=3, color="#6e8fd6"), marker=dict(size=8, color="#6e8fd6"),
+            name="Mean", showlegend=False,
             customdata=np.stack([agg["median"], agg["std"], agg["n"]], axis=1),
-            hovertemplate=(
-                "Task %{x}<br>Mean: %{y:.1f}s<br>"
-                "Median: %{customdata[0]:.1f}s<br>"
-                "SD: %{customdata[1]:.1f}s<br>"
-                "n=%{customdata[2]}<extra></extra>"
-            ),
-        ))
-        fig.update_layout(
-            title=f"Learning Curve — Task Duration over Repetitions — {n_recs} recording(s)",
-            xaxis=dict(title="Task Number", dtick=1),
-            yaxis_title="Duration (s)",
-            template="aoi_studio", autosize=True,
-            showlegend=False, margin=dict(t=50, b=40))
+            hovertemplate=("Task %{x}<br>Mean: %{y:.1f}s<br>Median: %{customdata[0]:.1f}s<br>"
+                           "SD: %{customdata[1]:.1f}s<br>n=%{customdata[2]}<extra></extra>"),
+        ), row=1, col=1)
+        fig.update_yaxes(title_text="Duration (s)", row=1, col=1)
+        layout = dict(template="aoi_studio", autosize=True, margin=dict(t=60, b=40))
+        if has_err:
+            buttons = self._add_error_traces(fig, agg_err, row=2, n_prefix=len(fig.data))
+            fig.update_xaxes(title_text="Task", dtick=1, row=2, col=1)
+            fig.update_yaxes(title_text="Mean error count", row=2, col=1)
+            layout["updatemenus"] = [dict(type="buttons", direction="right", x=0.0, y=1.10,
+                                          xanchor="left", active=2, buttons=buttons)]
+            layout["height"] = 640
+        else:
+            fig.update_xaxes(title_text="Task Number", dtick=1, row=1, col=1)
+            fig.update_layout(showlegend=False,
+                title=f"Learning Curve — Task Duration over Repetitions — {n_recs} recording(s)")
+        fig.update_layout(**layout)
         view.setHtml(self._fig_to_html(fig))
         return fig
 
@@ -2968,7 +2955,6 @@ _REC_TAB_DEFS = [
     ("heatmaps",     "AOI Heatmaps"),
     ("transitions",  "Transition Matrix"),
     ("learning",     "Learning Curve"),
-    ("errors",       "Errors"),
 ]
 
 # Roll-up of the 5 manual error fields into the graph's Type / Position axes.
