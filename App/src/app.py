@@ -3713,9 +3713,12 @@ class MainWindow(QMainWindow):
         self._play_timer.timeout.connect(self._play_tick)
 
         # Debounced auto-save of AOI corrections (writes straight into analysis.csv).
+        # Autosave persists LABELS ONLY (fast) so marking in/out never blocks the UI;
+        # the heavy re-projection/heatmap rebuild happens on the explicit Save button.
         self._autosave_timer = QTimer(self)
         self._autosave_timer.setSingleShot(True)
-        self._autosave_timer.timeout.connect(lambda: self._save_corrections_to_disk(silent=True))
+        self._autosave_timer.timeout.connect(
+            lambda: self._save_corrections_to_disk(silent=True, heavy=False))
 
         # Polls progress.json during analysis to fill the Analyse button.
         self._progress_timer = QTimer(self)
@@ -4137,6 +4140,7 @@ class MainWindow(QMainWindow):
     # ── Analysis ──────────────────────────────────────────────────────────────
 
     def _init_edit_state(self, n_frames: int, df: Optional[pd.DataFrame] = None) -> None:
+        self._reprojected = {}  # frame->label re-projection cache is per-recording
         self._edit_labels = list(self._csv_labels) if self._csv_labels else [NONE_LABEL] * n_frames
         if len(self._edit_labels) < n_frames:
             self._edit_labels.extend([NONE_LABEL] * (n_frames - len(self._edit_labels)))
@@ -4210,9 +4214,28 @@ class MainWindow(QMainWindow):
         """Debounced auto-save so corrections are always on disk (no data loss)."""
         self._autosave_timer.start(500)
 
-    def _save_corrections_to_disk(self, silent: bool = True) -> None:
+    def _save_corrections_to_disk(self, silent: bool = True, heavy: bool = False) -> None:
+        """Persist corrections to analysis.csv.
+
+        heavy=False (autosave): writes labels only — fast, never blocks the UI so
+        marking in/out stays responsive.
+        heavy=True (explicit Save): also re-projects gaze for the heatmap, rebuilds
+        the fixation/data-quality summaries, and reloads the dashboard. Runs under a
+        wait cursor and pumps events so the window never goes "Not Responding".
+        """
         if not self._rec_dir or not self._edit_labels:
             return
+        # Guard against re-entry: a heavy Save pumps events, so a second click (or an
+        # autosave firing) must not start an overlapping save on the same file.
+        if getattr(self, "_saving", False):
+            return
+        self._saving = True
+        try:
+            self._do_save_corrections(silent=silent, heavy=heavy)
+        finally:
+            self._saving = False
+
+    def _do_save_corrections(self, silent: bool, heavy: bool) -> None:
         csv_path = self._rec_dir / "aoi_results" / "raw" / "analysis.csv"
         if not csv_path.exists():
             csv_path = self._rec_dir / "aoi_results" / "analysis.csv"
@@ -4247,18 +4270,24 @@ class MainWindow(QMainWindow):
                 df = df.drop(columns=["final_primary_aoi"])
             if "aoi_transition" in df.columns:
                 df["aoi_transition"] = df["primary_aoi"].ne(df["primary_aoi"].shift()) & df["primary_aoi"].notna()
-            # Re-project the corrected frames' gaze onto their NEW surface so the
-            # heatmap reflects the edit (needs the persisted scene model).
-            self._reproject_corrected(df, pos, corrected)
-            df.to_csv(csv_path, index=False)
-            # Rebuild fixation_summary/data_quality from the corrected CSV so the
-            # Fixation and Data-Quality tabs update too.
-            try:
-                import analyzer
-                analyzer.write_summaries(csv_path.parent, csv_path, self._rec_dir.name, self._fps)
-            except Exception:
-                pass
-            self._dashboard.reload()
+            # Heavy work only on explicit Save: re-project the corrected frames' gaze
+            # onto their NEW surface (heatmap), rebuild summaries, reload dashboard.
+            # Autosave (heavy=False) skips all of this so it stays instant.
+            if heavy:
+                QApplication.setOverrideCursor(Qt.WaitCursor)
+                try:
+                    self._reproject_corrected(df, pos, corrected)
+                    df.to_csv(csv_path, index=False)
+                    try:
+                        import analyzer
+                        analyzer.write_summaries(csv_path.parent, csv_path, self._rec_dir.name, self._fps)
+                    except Exception:
+                        pass
+                    self._dashboard.reload()
+                finally:
+                    QApplication.restoreOverrideCursor()
+            else:
+                df.to_csv(csv_path, index=False)
             if not silent:
                 self._status_lbl.setText(f"Saved {changes} correction(s) to analysis.csv")
                 self._correction_panel._save_btn.setText("Saved ✓")
@@ -4291,14 +4320,25 @@ class MainWindow(QMainWindow):
             def __init__(self, t, c):
                 self.tag_id = t; self.corners = c
 
+        # Skip frames already re-projected for the same label so repeated Saves are cheap.
+        done = getattr(self, "_reprojected", None)
+        if done is None:
+            done = self._reprojected = {}
         try:
             model = rigid_surface.load_scene_model(model_path)
             det = analyzer.make_detector(1.0)
             scene_ts = self._recording.scene.time
-            for f, lbl in corrected:
+            todo = [(f, lbl) for f, lbl in corrected if done.get(f) != lbl]
+            total = len(todo)
+            for i, (f, lbl) in enumerate(todo):
+                # Pump the event loop so the window stays responsive during a long save.
+                if i % 6 == 0:
+                    self._status_lbl.setText(f"Updating heatmap… {i}/{total}")
+                    QApplication.processEvents()
                 if f not in pos:
                     continue
                 r = pos[f]
+                done[f] = lbl
                 if lbl == NONE_LABEL:
                     df.at[r, "gaze_on_aoi_x"] = ""
                     df.at[r, "gaze_on_aoi_y"] = ""
@@ -4325,8 +4365,8 @@ class MainWindow(QMainWindow):
             pass
 
     def _on_correction_saved(self) -> None:
-        # Save button = force an immediate (non-silent) save.
-        self._save_corrections_to_disk(silent=False)
+        # Save button = force an immediate (non-silent) save WITH heatmap re-projection.
+        self._save_corrections_to_disk(silent=False, heavy=True)
 
     def _run_analysis(self) -> None:
         if self._rec_dir is None:
