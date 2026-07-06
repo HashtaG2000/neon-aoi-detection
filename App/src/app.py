@@ -1725,17 +1725,17 @@ class DashboardWidget(QWidget):
             det_section = f"""
 <div class='section'><h3>Detection Method Breakdown</h3>
 <table><tr><th>Method</th><th>Frames</th><th>%</th></tr>
-<tr><td>3D Surface Mapper</td><td>{pr.get('surface_3d_frames','—')}</td>
+<tr><td>Direct fit (own tags)</td><td>{pr.get('surface_3d_frames','—')}</td>
     <td>{pr.get('surface_3d_pct','—')}%</td></tr>
-<tr><td>2D Partial-marker Fallback</td><td>{pr.get('fallback_2d_frames','—')}</td>
+<tr><td>Rigid-body projected</td><td>{pr.get('fallback_2d_frames','—')}</td>
     <td>{pr.get('fallback_2d_pct','—')}%</td></tr>
 <tr><td>No Detection (NoAOI)</td><td>{pr.get('no_aoi_frames','—')}</td>
     <td>{pr.get('no_aoi_pct','—')}%</td></tr>
 </table>
 <p style='color:#5a5d63;font-size:12px;margin-top:10px;line-height:1.7'>
-3D Surface Mapper = highest accuracy (all markers visible).<br>
-2D Fallback = partial marker visibility, still classified.<br>
-NoAOI = insufficient markers or gaze outside defined areas.
+Direct fit = surface formed from ≥2 of its own visible tags (highest accuracy).<br>
+Rigid-body projected = surface located from other tags via the calibrated rig.<br>
+NoAOI = no reliable surface, or gaze outside every AOI.
 </p></div>"""
 
         html = f"""<!DOCTYPE html><html><head><meta charset='utf-8'>

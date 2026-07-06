@@ -26,6 +26,7 @@ import os
 import pathlib
 import re
 import shutil
+import threading
 import warnings
 from concurrent.futures import ThreadPoolExecutor
 
@@ -37,12 +38,11 @@ import pupil_apriltags
 # full-range alternative is 4x slower — we deliberately keep the fast path. Silence it.
 warnings.filterwarnings("ignore", message=".*yuv420p.*")
 
-# Tag detection is the bottleneck (~40 ms/frame). Two levers, tuned once:
-#  * DETECT_STRIDE: only detect every Nth frame; the rig is static so surfaces barely
-#    move in ~100 ms — reuse the last detections in between (gaze is still per-frame).
-#  * a small thread pool: pupil_apriltags releases the GIL, so N detectors run
-#    concurrently across cores (~2.5x here).
-DETECT_STRIDE = 3
+# Tag detection is the bottleneck (~40 ms/frame). Speed comes from a small thread
+# pool (pupil_apriltags releases the GIL, so N detectors run concurrently across
+# cores, ~2.5x). DETECT_STRIDE=1 detects EVERY frame (no accuracy loss); raise it to
+# skip frames and reuse the last detections if you want more speed for less accuracy.
+DETECT_STRIDE = 1
 _N_DET = max(1, (os.cpu_count() or 4) // 4)
 _DETECT_CHUNK = 300
 
@@ -133,19 +133,28 @@ def enhance_frame(gray: np.ndarray, clahe=None) -> np.ndarray:
     return cv2.addWeighted(eq, 1.5, blur, -0.5, 0)
 
 
+_tls = threading.local()
+def _thread_detector():
+    """Per-thread detector + CLAHE. AprilTag/CLAHE objects are stateful and NOT
+    thread-safe, so every worker thread must have its own (sharing one causes
+    native crashes under concurrency)."""
+    if not hasattr(_tls, "det"):
+        _tls.det = make_detector(1.0)
+        _tls.clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+    return _tls.det, _tls.clahe
+
+
+def _detect_gray(gray):
+    det, clahe = _thread_detector()
+    return det.detect(enhance_frame(gray, clahe))
+
+
 def _stream_detections(frames, gaze_samps):
     """Yield (frame_idx, frame, gaze, detections) for the main pass.
 
-    Detects only every DETECT_STRIDE-th frame (reusing the last detections in
-    between, since the rig is static) and runs those detections concurrently on a
-    small thread pool of detectors. Gaze is still delivered per frame."""
-    detectors = [make_detector(1.0) for _ in range(_N_DET)]
-    clahes = [cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8)) for _ in range(_N_DET)]
-
-    def _detect(slot_gray):
-        slot, gray = slot_gray
-        return detectors[slot].detect(enhance_frame(gray, clahes[slot]))
-
+    Detects every DETECT_STRIDE-th frame (reusing the last detections in between,
+    since the rig is static) and runs those detections concurrently on a thread
+    pool — each worker thread uses its OWN detector. Gaze is delivered per frame."""
     pool = ThreadPoolExecutor(max_workers=_N_DET)
     last_det: list = []
     buf: list = []
@@ -153,8 +162,7 @@ def _stream_detections(frames, gaze_samps):
     def flush():
         nonlocal last_det
         det_idx = [k for k in range(len(buf)) if buf[k][0] % DETECT_STRIDE == 0]
-        jobs = [(i % _N_DET, buf[k][1].gray) for i, k in enumerate(det_idx)]
-        detmap = dict(zip(det_idx, pool.map(_detect, jobs)))
+        detmap = dict(zip(det_idx, pool.map(_detect_gray, [buf[k][1].gray for k in det_idx])))
         for k in range(len(buf)):
             if k in detmap:
                 last_det = detmap[k]
@@ -502,16 +510,26 @@ def write_summaries(out_dir: pathlib.Path, csv_path: pathlib.Path, rec_name: str
         "fps": round(fps, 1),
     }, indent=2), encoding="utf-8")
 
-    # ── preprocessing_report.json (dwell / coverage) ──
+    # ── preprocessing_report.json (dwell / coverage / detection method) ──
     aoi_names = [c[:-4] for c in df.columns if c.endswith("_hit")]
     dwell = {a: int((lbl == a).sum()) for a in aoi_names}
     detected = int((lbl != "NoAOI").sum())
+    # Detection-method split for the Data Quality breakdown: DIRECT = surface formed
+    # from >=2 of its own tags; PROJECTED = from the rigid body.
+    src = (df["aoi_hit_source"].fillna("").astype(str)
+           if "aoi_hit_source" in df.columns else pd.Series([""] * n))
+    direct = int((src == "direct").sum())
+    projected = int((src == "projected").sum())
     (out_dir / "preprocessing_report.json").write_text(json.dumps({
         "recording": rec_name,
         "total_frames": n,
         "aoi_detected_frames": detected,
         "no_aoi_frames": n - detected,
         "no_aoi_pct": round(100.0 * (n - detected) / n, 2),
+        "surface_3d_frames": direct,
+        "surface_3d_pct": round(100.0 * direct / n, 2),
+        "fallback_2d_frames": projected,
+        "fallback_2d_pct": round(100.0 * projected / n, 2),
         "fixation_count": n_fix,
         "fps": round(fps, 1),
         "recording_duration_s": round(dur, 2),
@@ -593,21 +611,20 @@ def analyze_recording(
     _cal = recording.calibration
     camera_K = np.array(_cal.scene_camera_matrix, dtype=np.float64)
     camera_D = np.array(_cal.scene_distortion_coefficients, dtype=np.float64).reshape(-1)
-    calib_stride = max(1, total // 450)
+    # Denser calibration sample (~1200 frames) so the rarely-decoded screen tags are
+    # seen often enough to triangulate the screen. Cheap now (parallel detection).
+    calib_stride = max(1, total // 1200)
     calib_positions = list(range(0, total, calib_stride))
     calib_ts = np.array([int(scene_ts[i]) for i in calib_positions])
     log.info("  Calibrating scene rigid body from %d sampled frames...", len(calib_positions))
-    _cd = [make_detector(1.0) for _ in range(_N_DET)]
-    _cc = [cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8)) for _ in range(_N_DET)]
-
-    def _cdetect(ig):
-        i, gray = ig
-        ds = _cd[i % _N_DET].detect(enhance_frame(gray, _cc[i % _N_DET]))
+    def _cdetect(gray):
+        det, clahe = _thread_detector()
+        ds = det.detect(enhance_frame(gray, clahe))
         return {int(d.tag_id): d.corners.astype(np.float64) for d in ds}
 
     _cgrays = [cf.gray for cf in recording.scene.sample(calib_ts)]
     with ThreadPoolExecutor(max_workers=_N_DET) as _cpool:
-        calib_dets = list(_cpool.map(_cdetect, enumerate(_cgrays)))
+        calib_dets = list(_cpool.map(_cdetect, _cgrays))
     del _cgrays
     scene_model = rigid_surface.calibrate_scene(calib_dets, AOI_CONFIG, camera_K, camera_D, log=log)
 
@@ -773,11 +790,13 @@ def analyze_recording(
                                 best_rank = rank
                                 primary_aoi = aoi_name
                                 primary_surface = aoi_name
-                                hit_source = "surface"
+                                own_tags = sum(1 for d in detections if d.tag_id in aoi_ids)
+                                # DIRECT = surface formed from >=2 of its own tags (matches
+                                # surface_quad's gate); PROJECTED = from the rigid body.
+                                hit_source = "direct" if own_tags >= 2 else "projected"
                                 gaze_on_aoi_x = f"{min(max(u, 0.0), 1.0):.5f}"
                                 gaze_on_aoi_y = f"{min(max(v, 0.0), 1.0):.5f}"
-                                primary_marker_count = str(
-                                    sum(1 for d in detections if d.tag_id in aoi_ids))
+                                primary_marker_count = str(own_tags)
                                 primary_surface_initialized = "True"
 
                 # 4. Handle Logging
