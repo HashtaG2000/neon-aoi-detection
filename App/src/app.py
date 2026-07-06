@@ -4230,22 +4230,34 @@ class MainWindow(QMainWindow):
             else:
                 pos = {i: i for i in range(len(df))}
             # Ensure string labels can be written even if the column was all-NaN (float).
-            df["primary_aoi"] = df["primary_aoi"].astype("object")
-            if "aoi_hit_source" in df.columns:
-                df["aoi_hit_source"] = df["aoi_hit_source"].astype("object")
+            for c in ("primary_aoi", "aoi_hit_source", "gaze_on_aoi_x", "gaze_on_aoi_y"):
+                if c in df.columns:
+                    df[c] = df[c].astype("object")
             changes = 0
+            corrected: list[tuple[int, str]] = []
             for f, (lbl, src) in enumerate(zip(self._edit_labels, self._edit_sources)):
                 if src == "manual" and f in pos:
                     df.at[pos[f], "primary_aoi"] = lbl
                     if "aoi_hit_source" in df.columns:
                         df.at[pos[f], "aoi_hit_source"] = "manual"
+                    corrected.append((f, lbl))
                     changes += 1
             # Single source of truth is primary_aoi — drop any legacy correction column.
             if "final_primary_aoi" in df.columns:
                 df = df.drop(columns=["final_primary_aoi"])
             if "aoi_transition" in df.columns:
                 df["aoi_transition"] = df["primary_aoi"].ne(df["primary_aoi"].shift()) & df["primary_aoi"].notna()
+            # Re-project the corrected frames' gaze onto their NEW surface so the
+            # heatmap reflects the edit (needs the persisted scene model).
+            self._reproject_corrected(df, pos, corrected)
             df.to_csv(csv_path, index=False)
+            # Rebuild fixation_summary/data_quality from the corrected CSV so the
+            # Fixation and Data-Quality tabs update too.
+            try:
+                import analyzer
+                analyzer.write_summaries(csv_path.parent, csv_path, self._rec_dir.name, self._fps)
+            except Exception:
+                pass
             self._dashboard.reload()
             if not silent:
                 self._status_lbl.setText(f"Saved {changes} correction(s) to analysis.csv")
@@ -4254,6 +4266,63 @@ class MainWindow(QMainWindow):
         except Exception as e:
             if not silent:
                 QMessageBox.critical(self, APP_TITLE, f"Failed to save corrections: {e}")
+
+    def _reproject_corrected(self, df: pd.DataFrame, pos: dict, corrected: list) -> None:
+        """Recompute gaze_on_aoi_x/y for corrected frames by re-detecting the frame
+        and projecting the gaze onto the NEW surface (so the heatmap updates). Uses
+        the scene model saved during analysis; silently no-ops for older analyses."""
+        if not corrected or self._recording is None:
+            return
+        model_path = None
+        for p in [self._rec_dir / "aoi_results" / "raw" / "scene_model.pkl",
+                  self._rec_dir / "aoi_results" / "scene_model.pkl"]:
+            if p.exists():
+                model_path = p
+                break
+        if model_path is None or "gaze_on_aoi_x" not in df.columns:
+            return
+        try:
+            import rigid_surface, analyzer
+        except Exception:
+            return
+
+        class _D:
+            __slots__ = ("tag_id", "corners")
+            def __init__(self, t, c):
+                self.tag_id = t; self.corners = c
+
+        try:
+            model = rigid_surface.load_scene_model(model_path)
+            det = analyzer.make_detector(1.0)
+            scene_ts = self._recording.scene.time
+            for f, lbl in corrected:
+                if f not in pos:
+                    continue
+                r = pos[f]
+                if lbl == NONE_LABEL:
+                    df.at[r, "gaze_on_aoi_x"] = ""
+                    df.at[r, "gaze_on_aoi_y"] = ""
+                    continue
+                if f >= len(scene_ts):
+                    continue
+                gx = pd.to_numeric(pd.Series([df.at[r, "gaze_x_px"]]), errors="coerce").iloc[0]
+                gy = pd.to_numeric(pd.Series([df.at[r, "gaze_y_px"]]), errors="coerce").iloc[0]
+                if not (np.isfinite(gx) and np.isfinite(gy)):
+                    continue
+                frame = next(iter(self._recording.scene.sample(np.array([int(scene_ts[f])]))))
+                dets = [_D(int(d.tag_id), d.corners.astype(np.float64))
+                        for d in det.detect(analyzer.enhance_frame(frame.gray))]
+                loc = model.localize(dets)
+                cr, ct = (loc[0], loc[1]) if loc else (None, None)
+                quad = model.surface_quad(lbl, dets, cr, ct)
+                if quad is None:
+                    continue
+                uv = model.gaze_to_surface(lbl, float(gx), float(gy), cr, ct, image_quad=quad)
+                if uv is not None:
+                    df.at[r, "gaze_on_aoi_x"] = f"{min(max(uv[0], 0.0), 1.0):.5f}"
+                    df.at[r, "gaze_on_aoi_y"] = f"{min(max(uv[1], 0.0), 1.0):.5f}"
+        except Exception:
+            pass
 
     def _on_correction_saved(self) -> None:
         # Save button = force an immediate (non-silent) save.
