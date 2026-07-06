@@ -30,6 +30,7 @@ recovered from the other surfaces' tags.
 from __future__ import annotations
 
 import itertools
+import pickle
 from dataclasses import dataclass, field
 
 import cv2
@@ -179,12 +180,16 @@ def _reproj_err(template: dict[int, np.ndarray], frames: list[dict[int, np.ndarr
 def _build_quad_template(
     tag_ids: list[int], L_cm: float, H_cm: float, frames: list[dict[int, np.ndarray]]
 ) -> dict[int, np.ndarray] | None:
-    """4-tag surface: brute-force the corner->tag assignment by lowest reprojection."""
+    """4-tag surface: pick the corner->tag assignment by lowest reprojection.
+    The assignment is fixed geometry, so only a few well-populated frames are needed —
+    brute-force the 24 permutations over a small sample instead of every frame."""
     rect = _rect_centres(L_cm, H_cm)
+    sample = sorted(frames, key=lambda fr: -sum(t in fr for t in tag_ids))
+    sample = [fr for fr in sample if sum(t in fr for t in tag_ids) >= 2][:40] or frames[:40]
     best_err, best = 1e9, None
     for perm in itertools.permutations(tag_ids):
         tmpl = {tid: _tag_corners_at(*rect[i]) for i, tid in enumerate(perm)}
-        err = _reproj_err(tmpl, frames)
+        err = _reproj_err(tmpl, sample)
         if err < best_err:
             best_err, best = err, tmpl
     return best
@@ -264,7 +269,10 @@ class SceneModel:
         local = self.surface_local_quad.get(surface)
         if tmpl is not None and local is not None:
             vis = [d for d in detections if d.tag_id in tmpl]
-            if vis:
+            # Require >=2 of this surface's OWN tags: a single tag would have to
+            # extrapolate the whole quad and can badly mis-place a large surface
+            # (e.g. Board). With 0-1 tags, fall back to the rigid-body projection.
+            if len(vis) >= 2:
                 obj = np.vstack([tmpl[d.tag_id] for d in vis])
                 img = np.vstack([d.corners for d in vis]).astype(np.float64)
                 flag = cv2.SOLVEPNP_IPPE if len(vis) >= 2 else cv2.SOLVEPNP_IPPE_SQUARE
@@ -398,8 +406,10 @@ def calibrate_scene(
     # phantom hit).
     def _surface_reproj(surf):
         stags = set(templates[surf])
+        # Informational only (we never drop), so sample a few frames, not all of them.
+        cand = [fr for fr in frames if any(t in fr for t in stags)][:40]
         errs = []
-        for fr in frames:
+        for fr in cand:
             svis = [t for t in stags if t in fr and t in model.world_tag_corners]
             others = [t for t in fr if t in model.world_tag_corners and t not in stags]
             if not svis or len(others) < 2:
@@ -494,3 +504,28 @@ def calibrate_scene(
     }
     _log(f"  Rigid-body calibration: placed {model.placed} (screen={'yes' if screen_placed else 'NO'})")
     return model
+
+
+# ── Persistence (so corrections can re-project gaze without re-calibrating) ─────
+
+def save_scene_model(model: SceneModel, path) -> None:
+    with open(path, "wb") as f:
+        pickle.dump({
+            "K": model.K, "D": model.D,
+            "world_tag_corners": model.world_tag_corners,
+            "templates": model.templates,
+            "surface_local_quad": model.surface_local_quad,
+            "surface_quad_world": model.surface_quad_world,
+            "surface_tags": model.surface_tags,
+        }, f)
+
+
+def load_scene_model(path) -> SceneModel:
+    with open(path, "rb") as f:
+        d = pickle.load(f)
+    m = SceneModel(K=d["K"], D=d["D"], surface_tags=d.get("surface_tags", {}))
+    m.world_tag_corners = d.get("world_tag_corners", {})
+    m.templates = d.get("templates", {})
+    m.surface_local_quad = d.get("surface_local_quad", {})
+    m.surface_quad_world = d.get("surface_quad_world", {})
+    return m

@@ -3747,6 +3747,12 @@ class MainWindow(QMainWindow):
         self._batch_action.setToolTip("Re-run analysis on every recording in the current condition")
         self._batch_action.triggered.connect(self._run_batch_analysis)
         analyse_menu.addAction(self._batch_action)
+        # Validation video is slow to encode — off by default; toggle on to eyeball tracking.
+        self._gen_video_action = QAction("Generate validation video (slower)", self)
+        self._gen_video_action.setCheckable(True)
+        self._gen_video_action.setChecked(False)
+        self._gen_video_action.setToolTip("When on, Analyse also writes the overlay .mp4 (much slower)")
+        analyse_menu.addAction(self._gen_video_action)
         analyse_menu.addSeparator()
         self._watcher: Optional[WatcherWorker] = None
         self._watcher_action = QAction("▶  Auto-analyse all pending (temporary)", self)
@@ -4288,7 +4294,7 @@ class MainWindow(QMainWindow):
         worker = AnalysisWorker(
             self._rec_dir,
             trim=self._trim_panel.get_trim(),
-            generate_video=True,  # validation video to verify surface tracking
+            generate_video=self._gen_video_action.isChecked(),  # off by default (fast)
             generation=gen,
         )
         worker.signals.status.connect(self._status_lbl.setText)

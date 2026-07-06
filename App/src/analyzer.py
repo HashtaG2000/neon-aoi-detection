@@ -22,13 +22,29 @@ import collections
 import csv
 import json
 import logging
+import os
 import pathlib
 import re
 import shutil
+import warnings
+from concurrent.futures import ThreadPoolExecutor
 
 import cv2
 import numpy as np
 import pupil_apriltags
+
+# `frame.gray` uses the fast Y-plane path (range 16-235); the library warns that the
+# full-range alternative is 4x slower — we deliberately keep the fast path. Silence it.
+warnings.filterwarnings("ignore", message=".*yuv420p.*")
+
+# Tag detection is the bottleneck (~40 ms/frame). Two levers, tuned once:
+#  * DETECT_STRIDE: only detect every Nth frame; the rig is static so surfaces barely
+#    move in ~100 ms — reuse the last detections in between (gaze is still per-frame).
+#  * a small thread pool: pupil_apriltags releases the GIL, so N detectors run
+#    concurrently across cores (~2.5x here).
+DETECT_STRIDE = 3
+_N_DET = max(1, (os.cpu_count() or 4) // 4)
+_DETECT_CHUNK = 300
 
 from paths import CONFIG_DIR, RECORDINGS_DIR, ensure_vendor_paths
 
@@ -106,14 +122,54 @@ def make_detector(decimate: float = 1.0) -> pupil_apriltags.Detector:
 
 
 _clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
-def enhance_frame(gray: np.ndarray) -> np.ndarray:
+def enhance_frame(gray: np.ndarray, clahe=None) -> np.ndarray:
     """Normalise the frame so AprilTags decode reliably in all lighting/blur.
     The rig and lighting are physically constant across recordings, so this is
     tuned once: CLAHE evens out brightness/contrast, then a mild unsharp mask
-    counters motion blur. Applied identically in calibration and the main pass."""
-    eq = _clahe.apply(gray)
+    counters motion blur. Applied identically in calibration and the main pass.
+    Pass a per-thread `clahe` when calling from worker threads (CLAHE is stateful)."""
+    eq = (clahe or _clahe).apply(gray)
     blur = cv2.GaussianBlur(eq, (0, 0), 1.0)
     return cv2.addWeighted(eq, 1.5, blur, -0.5, 0)
+
+
+def _stream_detections(frames, gaze_samps):
+    """Yield (frame_idx, frame, gaze, detections) for the main pass.
+
+    Detects only every DETECT_STRIDE-th frame (reusing the last detections in
+    between, since the rig is static) and runs those detections concurrently on a
+    small thread pool of detectors. Gaze is still delivered per frame."""
+    detectors = [make_detector(1.0) for _ in range(_N_DET)]
+    clahes = [cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8)) for _ in range(_N_DET)]
+
+    def _detect(slot_gray):
+        slot, gray = slot_gray
+        return detectors[slot].detect(enhance_frame(gray, clahes[slot]))
+
+    pool = ThreadPoolExecutor(max_workers=_N_DET)
+    last_det: list = []
+    buf: list = []
+
+    def flush():
+        nonlocal last_det
+        det_idx = [k for k in range(len(buf)) if buf[k][0] % DETECT_STRIDE == 0]
+        jobs = [(i % _N_DET, buf[k][1].gray) for i, k in enumerate(det_idx)]
+        detmap = dict(zip(det_idx, pool.map(_detect, jobs)))
+        for k in range(len(buf)):
+            if k in detmap:
+                last_det = detmap[k]
+            yield buf[k][0], buf[k][1], buf[k][2], last_det
+
+    try:
+        for fi, (frame, gaze) in enumerate(zip(frames, gaze_samps, strict=False)):
+            buf.append((fi, frame, gaze))
+            if len(buf) >= _DETECT_CHUNK:
+                yield from flush()
+                buf = []
+        if buf:
+            yield from flush()
+    finally:
+        pool.shutdown(wait=True)
 
 
 # ── Geometry & Hit-Test Helpers ───────────────────────────────────────────────
@@ -481,8 +537,6 @@ def analyze_recording(
 
     recording = nr.load(str(recording_dir))
     camera    = make_camera(recording)
-    detector_high = make_detector(1.0)
-    detector_low  = make_detector(2.0)
     
     aois = [AOI(name, ids) for name, ids in AOI_CONFIG.items()]
     try:
@@ -539,17 +593,22 @@ def analyze_recording(
     _cal = recording.calibration
     camera_K = np.array(_cal.scene_camera_matrix, dtype=np.float64)
     camera_D = np.array(_cal.scene_distortion_coefficients, dtype=np.float64).reshape(-1)
-    calib_stride = max(1, total // 700)
+    calib_stride = max(1, total // 450)
     calib_positions = list(range(0, total, calib_stride))
     calib_ts = np.array([int(scene_ts[i]) for i in calib_positions])
     log.info("  Calibrating scene rigid body from %d sampled frames...", len(calib_positions))
-    calib_dets = []
-    for cf in recording.scene.sample(calib_ts):
-        g = enhance_frame(cf.gray)
-        ds = detector_high.detect(g)
-        if len(ds) < 2:
-            ds = detector_low.detect(g)
-        calib_dets.append({d.tag_id: d.corners.astype(np.float64) for d in ds})
+    _cd = [make_detector(1.0) for _ in range(_N_DET)]
+    _cc = [cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8)) for _ in range(_N_DET)]
+
+    def _cdetect(ig):
+        i, gray = ig
+        ds = _cd[i % _N_DET].detect(enhance_frame(gray, _cc[i % _N_DET]))
+        return {int(d.tag_id): d.corners.astype(np.float64) for d in ds}
+
+    _cgrays = [cf.gray for cf in recording.scene.sample(calib_ts)]
+    with ThreadPoolExecutor(max_workers=_N_DET) as _cpool:
+        calib_dets = list(_cpool.map(_cdetect, enumerate(_cgrays)))
+    del _cgrays
     scene_model = rigid_surface.calibrate_scene(calib_dets, AOI_CONFIG, camera_K, camera_D, log=log)
 
     def _quad_area(q):
@@ -575,6 +634,13 @@ def analyze_recording(
         except PermissionError:
             log.warning("  Could not delete old output folder — files may be open. Overwriting in place.")
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Persist the rig so AOI corrections can re-project gaze onto a new surface
+    # (updating the heatmap) without re-running the whole calibration.
+    try:
+        rigid_surface.save_scene_model(scene_model, out_dir / "scene_model.pkl")
+    except Exception as _e:
+        log.warning("  Could not save scene model: %s", _e)
 
     csv_path   = out_dir / "analysis.csv"
     video_path = out_dir / "validation_video.mp4"
@@ -635,7 +701,7 @@ def analyze_recording(
             ] + [f"{n}_hit" for n in aoi_names] + ["aoi_transition", "time_in_current_aoi_ms"]
               + [f"{n}_visits" for n in aoi_names] + ["markers_detected"])
 
-            for frame_idx, (frame, gaze) in enumerate(zip(frames, gaze_samps, strict=False)):
+            for frame_idx, frame, gaze, detections in _stream_detections(frames, gaze_samps):
                 global_frame = global_start_idx + frame_idx
                 if frame_idx % 30 == 0:
                     percent = frame_idx / total * 100 if total else 0.0
@@ -666,12 +732,7 @@ def analyze_recording(
                         scanpath.append((fix_cx, fix_cy))
                         last_fix_id = fix_id
 
-                gray_enhanced = enhance_frame(frame.gray)
-                detections    = detector_high.detect(gray_enhanced)
-                if len(detections) < 2:
-                    # Multi-pass: drop decimation for motion-blurred frames
-                    detections = detector_low.detect(gray_enhanced)
-                    
+                # `detections` is provided by _stream_detections (strided + threaded).
                 detected_ids  = [d.tag_id for d in detections]
 
                 row_hits        = {n: False for n in aoi_names}
