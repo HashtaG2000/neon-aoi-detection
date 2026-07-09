@@ -426,12 +426,9 @@ def calibrate_scene(
 
     # Keep ALL surfaces (no dropping). Reprojection-from-the-anchor is only a rough
     # quality hint — a correctly-placed but distant surface can read high purely from
-    # lever-arm noise — so we just log a note; the per-frame projection gating still
-    # skips genuinely bad frames (behind camera / degenerate quad / shaky pose).
-    for surf in [s for s in world_pose if s != anchor]:
-        med, n = _surface_reproj(surf)
-        if n >= 3 and med > SURFACE_DROP_PX:
-            _log(f"  Note: {surf} placement is loose (reproj {med:.0f}px) — kept.")
+    # lever-arm noise, and the per-frame projection gating already skips genuinely bad
+    # frames (behind camera / degenerate quad / shaky pose). It's non-actionable, so we
+    # don't log it as a warning.
 
     # 4. Accurate camera poses from non-screen world tags ----------------------
     def cam_pose(fr):

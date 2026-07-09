@@ -121,6 +121,22 @@ def make_detector(decimate: float = 1.0) -> pupil_apriltags.Detector:
     )
 
 
+def make_screen_detector() -> pupil_apriltags.Detector:
+    """Aggressive detector for the calibration pass. Combined with 2x upscaling it
+    recovers the small, grazing-angle SCREEN corner tags (12/13/14/15) that the
+    standard 1x detector misses — measured on 96ARP to go from 1 screen tag to 3,
+    which is what lets the screen triangulate. Slower, so only used in calibration."""
+    return pupil_apriltags.Detector(
+        families="tag36h11",
+        nthreads=4,
+        quad_decimate=1.0,
+        quad_sigma=0.8,
+        refine_edges=1,
+        decode_sharpening=1.5,
+        debug=0,
+    )
+
+
 _clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
 def enhance_frame(gray: np.ndarray, clahe=None) -> np.ndarray:
     """Normalise the frame so AprilTags decode reliably in all lighting/blur.
@@ -147,6 +163,26 @@ def _thread_detector():
 def _detect_gray(gray):
     det, clahe = _thread_detector()
     return det.detect(enhance_frame(gray, clahe))
+
+
+def _calib_detect(gray):
+    """High-recall detection for the CALIBRATION pass only. Runs two passes and
+    unions them so it never detects fewer tags than the main pass, but adds the
+    rare screen tags:
+      1. standard 1x enhanced (solid for the well-seen Board/Box/Deck tags),
+      2. 2x-upscaled RAW + aggressive detector (recovers the tiny screen tags —
+         CLAHE/unsharp actually hurts those, so this pass uses raw gray).
+    2x corners are preferred where a tag appears in both (higher precision).
+    Returns {tag_id: 4x2 corners} in original-image pixels."""
+    det, clahe = _thread_detector()
+    if not hasattr(_tls, "sdet"):
+        _tls.sdet = make_screen_detector()
+    out = {int(d.tag_id): d.corners.astype(np.float64)
+           for d in det.detect(enhance_frame(gray, clahe))}
+    up = cv2.resize(gray, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
+    for d in _tls.sdet.detect(up):
+        out[int(d.tag_id)] = d.corners.astype(np.float64) / 2.0
+    return out
 
 
 def _stream_detections(frames, gaze_samps):
@@ -611,20 +647,18 @@ def analyze_recording(
     _cal = recording.calibration
     camera_K = np.array(_cal.scene_camera_matrix, dtype=np.float64)
     camera_D = np.array(_cal.scene_distortion_coefficients, dtype=np.float64).reshape(-1)
-    # Denser calibration sample (~1200 frames) so the rarely-decoded screen tags are
-    # seen often enough to triangulate the screen. Cheap now (parallel detection).
-    calib_stride = max(1, total // 1200)
+    # Dense calibration sample (~2000 frames) + high-recall detection (2x upscale)
+    # so the rarely-decoded screen tags are caught often enough to triangulate the
+    # screen. Proven on 96ARP: screen goes NO->yes. This only runs once (calibration);
+    # the main pass keeps the fast 1x detection, so the long pass is not slowed.
+    calib_stride = max(1, total // 2000)
     calib_positions = list(range(0, total, calib_stride))
     calib_ts = np.array([int(scene_ts[i]) for i in calib_positions])
-    log.info("  Calibrating scene rigid body from %d sampled frames...", len(calib_positions))
-    def _cdetect(gray):
-        det, clahe = _thread_detector()
-        ds = det.detect(enhance_frame(gray, clahe))
-        return {int(d.tag_id): d.corners.astype(np.float64) for d in ds}
-
+    log.info("  Calibrating scene rigid body from %d sampled frames (high-recall)...",
+             len(calib_positions))
     _cgrays = [cf.gray for cf in recording.scene.sample(calib_ts)]
     with ThreadPoolExecutor(max_workers=_N_DET) as _cpool:
-        calib_dets = list(_cpool.map(_cdetect, _cgrays))
+        calib_dets = list(_cpool.map(_calib_detect, _cgrays))
     del _cgrays
     scene_model = rigid_surface.calibrate_scene(calib_dets, AOI_CONFIG, camera_K, camera_D, log=log)
 
