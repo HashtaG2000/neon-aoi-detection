@@ -2066,7 +2066,10 @@ td{{border-bottom:1px solid rgba(255,255,255,.04)}}
 
     @staticmethod
     def _has_errors(series: dict) -> bool:
-        return bool(series) and not all(sum(v.values()) == 0 for v in series.values())
+        # Show the error panel whenever error data was recorded — even if every task
+        # is 0 (an error-free run is itself a result worth seeing beside the curve).
+        # Empty series (no errors.json at all) still hides it.
+        return bool(series)
 
     def _agg_error_series(self, csvs: list[tuple[str, pathlib.Path]]) -> dict:
         """Mean per-task error series across the given recordings."""
@@ -2096,6 +2099,13 @@ td{{border-bottom:1px solid rgba(255,255,255,.04)}}
         for name, y, color in specs:
             fig.add_trace(go.Scatter(x=tasks, y=y, mode="lines+markers", name=name,
                                      line=dict(color=color), showlegend=True), row=row, col=1)
+        # Float the axis floor slightly below 0 so the line for an all-zero (error-free)
+        # run sits ABOVE the x-axis instead of lying on top of it.
+        ymax = max([0.0] + ct + cp + kt + kp + comp_tot + cable_tot)
+        top = max(1.0, ymax * 1.15)
+        pad = max(0.4, ymax * 0.06)
+        fig.update_yaxes(range=[-pad, top], dtick=(1 if top <= 12 else None),
+                         zeroline=True, row=row, col=1)
         views = {"Components": [True, True, False, False, False, False],
                  "Cables":     [False, False, True, True, False, False],
                  "All / Both": [False, False, False, False, True, True]}
