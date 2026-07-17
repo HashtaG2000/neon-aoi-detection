@@ -2021,8 +2021,13 @@ td{{border-bottom:1px solid rgba(255,255,255,.04)}}
             return
 
         # Errors render as a second panel DIRECTLY under the learning curve, sharing
-        # the Task 1-10 x-axis so repetitions line up vertically.
+        # the Task 1-10 x-axis so repetitions line up vertically. If no errors were
+        # recorded, default to a zero series so the panel STILL shows (an error-free
+        # or not-yet-scored run reads as flat zeros, rather than hiding the panel).
         series = _error_series(_load_errors_json(rec_dir))
+        if not series:
+            series = {int(ti): {"comp_type": 0, "comp_pos": 0, "cable_type": 0, "cable_pos": 0}
+                      for ti in tdf["task_idx"].tolist()}
         has_err = self._has_errors(series)
         if has_err:
             fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.13,
@@ -2536,6 +2541,9 @@ td{{border-bottom:1px solid rgba(255,255,255,.04)}}
                .reset_index().sort_values("task_idx"))
         agg["std"] = agg["std"].fillna(0)
         agg_err = self._agg_error_series(csvs)
+        if not agg_err:
+            agg_err = {int(ti): {"comp_type": 0, "comp_pos": 0, "cable_type": 0, "cable_pos": 0}
+                       for ti in agg["task_idx"].tolist()}
         has_err = self._has_errors(agg_err)
         if has_err:
             fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.13,
