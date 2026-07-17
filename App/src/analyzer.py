@@ -185,6 +185,15 @@ def _calib_detect(gray):
     return out
 
 
+def _cdetect_fast(gray):
+    """Plain 1x calibration detection. Used when the screen already decodes >=2 tags
+    per frame (good-marker recordings), so the expensive 2x high-recall pass in
+    _calib_detect isn't needed and calibration runs ~4x faster."""
+    det, clahe = _thread_detector()
+    return {int(d.tag_id): d.corners.astype(np.float64)
+            for d in det.detect(enhance_frame(gray, clahe))}
+
+
 def _stream_detections(frames, gaze_samps):
     """Yield (frame_idx, frame, gaze, detections) for the main pass.
 
@@ -647,20 +656,47 @@ def analyze_recording(
     _cal = recording.calibration
     camera_K = np.array(_cal.scene_camera_matrix, dtype=np.float64)
     camera_D = np.array(_cal.scene_distortion_coefficients, dtype=np.float64).reshape(-1)
-    # Dense calibration sample (~2000 frames) + high-recall detection (2x upscale)
-    # so the rarely-decoded screen tags are caught often enough to triangulate the
-    # screen. Proven on 96ARP: screen goes NO->yes. This only runs once (calibration);
-    # the main pass keeps the fast 1x detection, so the long pass is not slowed.
-    calib_stride = max(1, total // 2000)
-    calib_positions = list(range(0, total, calib_stride))
-    calib_ts = np.array([int(scene_ts[i]) for i in calib_positions])
-    log.info("  Calibrating scene rigid body from %d sampled frames (high-recall)...",
-             len(calib_positions))
-    _cgrays = [cf.gray for cf in recording.scene.sample(calib_ts)]
-    with ThreadPoolExecutor(max_workers=_N_DET) as _cpool:
-        calib_dets = list(_cpool.map(_calib_detect, _cgrays))
-    del _cgrays
-    scene_model = rigid_surface.calibrate_scene(calib_dets, AOI_CONFIG, camera_K, camera_D, log=log)
+
+    # The rig geometry never changes for a recording, so calibration is cached to
+    # scene_model.pkl and REUSED on re-analysis — skipping the whole calibration pass.
+    # Delete scene_model.pkl to force a fresh calibration.
+    _model_cache = (output_dir or recording_dir / "aoi_results" / "raw") / "scene_model.pkl"
+    scene_model = None
+    if _model_cache.exists():
+        try:
+            _cached = rigid_surface.load_scene_model(_model_cache)
+            if _cached.templates and _cached.surface_quad_world and _cached.K is not None:
+                scene_model = _cached
+                log.info("  Reusing cached scene model (skipping calibration). Placed: %s",
+                         list(_cached.surface_quad_world))
+        except Exception as _e:
+            log.warning("  Could not load cached scene model (%s); recalibrating.", _e)
+            scene_model = None
+
+    if scene_model is None:
+        # Decide detection strength: the expensive 2x high-recall pass is only needed
+        # when the screen does NOT already decode >=2 tags per frame (poor-marker
+        # recordings, e.g. some Gamified). On good-marker recordings the screen forms
+        # directly, so plain 1x calibration suffices and is ~4x faster.
+        _screen_ids = set(rigid_surface.SCREEN_CORNER_IDS.values())
+        _pre_ts = np.array([int(scene_ts[i]) for i in range(0, total, max(1, total // 100))])
+        with ThreadPoolExecutor(max_workers=_N_DET) as _ppool:
+            _pre = list(_ppool.map(lambda g: {int(d.tag_id) for d in _detect_gray(g)},
+                                   [cf.gray for cf in recording.scene.sample(_pre_ts)]))
+        _ge2 = sum(1 for s in _pre if len(s & _screen_ids) >= 2)
+        _use_highrecall = (_ge2 / max(1, len(_pre))) < 0.03
+        _detect_fn = _calib_detect if _use_highrecall else _cdetect_fast
+
+        calib_stride = max(1, total // 2000)
+        calib_positions = list(range(0, total, calib_stride))
+        calib_ts = np.array([int(scene_ts[i]) for i in calib_positions])
+        log.info("  Calibrating scene rigid body from %d sampled frames (%s)...",
+                 len(calib_positions), "high-recall 2x" if _use_highrecall else "fast 1x")
+        _cgrays = [cf.gray for cf in recording.scene.sample(calib_ts)]
+        with ThreadPoolExecutor(max_workers=_N_DET) as _cpool:
+            calib_dets = list(_cpool.map(_detect_fn, _cgrays))
+        del _cgrays
+        scene_model = rigid_surface.calibrate_scene(calib_dets, AOI_CONFIG, camera_K, camera_D, log=log)
 
     def _quad_area(q):
         return 0.5 * float(np.linalg.norm(np.cross(q[2] - q[0], q[3] - q[1])))
