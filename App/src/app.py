@@ -2098,12 +2098,20 @@ td{{border-bottom:1px solid rgba(255,255,255,.04)}}
         kp = [series[t]["cable_pos"] for t in tasks]
         comp_tot = [ct[i] + cp[i] for i in range(len(tasks))]
         cable_tot = [kt[i] + kp[i] for i in range(len(tasks))]
-        specs = [("Component · Type", ct, "#d4a24a"), ("Component · Position", cp, "#6fae7d"),
-                 ("Cable · Type", kt, "#c07ba8"), ("Cable · Position", kp, "#6e8fd6"),
-                 ("Components (total)", comp_tot, "#d4a24a"), ("Cables (total)", cable_tot, "#6e8fd6")]
-        for name, y, color in specs:
-            fig.add_trace(go.Scatter(x=tasks, y=y, mode="lines+markers", name=name,
-                                     line=dict(color=color), showlegend=True), row=row, col=1)
+        # Each of the two traces shown in a view gets a contrasting dash + marker and a
+        # tiny opposite x-nudge, so when both are flat at 0 (an error-free run) they stay
+        # visibly distinct instead of collapsing into one line.
+        specs = [("Component · Type",     ct,        "#d4a24a", "solid", -0.08, "circle"),
+                 ("Component · Position", cp,        "#6fae7d", "dash",  +0.08, "square"),
+                 ("Cable · Type",         kt,        "#c07ba8", "solid", -0.08, "circle"),
+                 ("Cable · Position",     kp,        "#6e8fd6", "dash",  +0.08, "square"),
+                 ("Components (total)",   comp_tot,  "#d4a24a", "solid", -0.08, "circle"),
+                 ("Cables (total)",       cable_tot, "#6e8fd6", "dash",  +0.08, "square")]
+        for name, y, color, dash, xoff, sym in specs:
+            fig.add_trace(go.Scatter(x=[t + xoff for t in tasks], y=y, mode="lines+markers",
+                                     name=name, line=dict(color=color, dash=dash),
+                                     marker=dict(symbol=sym, size=8),
+                                     showlegend=True), row=row, col=1)
         # Float the axis floor slightly below 0 so the line for an all-zero (error-free)
         # run sits ABOVE the x-axis instead of lying on top of it.
         ymax = max([0.0] + ct + cp + kt + kp + comp_tot + cable_tot)
