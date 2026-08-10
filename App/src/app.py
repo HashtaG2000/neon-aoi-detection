@@ -3431,6 +3431,11 @@ class ComparisonWidget(QWidget):
         for df, section in [
             (report.aoi_stats,    "Per-AOI Metrics"),
             (report.overall_stats, "Overall Metrics"),
+            (getattr(report, "screen_position_stats", None),
+             "Screen — Mean Gaze Position (within-surface, per participant)"),
+            (getattr(report, "screen_grid_stats", None),
+             f"Screen — {reporting.SCREEN_GRID_N}x{reporting.SCREEN_GRID_N} Grid-Cell Occupancy "
+             "(per participant, Benjamini-Hochberg FDR-corrected p)"),
         ]:
             if df is None or df.empty:
                 continue
