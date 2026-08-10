@@ -632,8 +632,10 @@ def _screen_spatial_stats(
             hx = np.clip((x * SCREEN_GRID_N).astype(int), 0, SCREEN_GRID_N - 1)
             hy = np.clip((y * SCREEN_GRID_N).astype(int), 0, SCREEN_GRID_N - 1)
             cell = np.zeros(SCREEN_GRID_N * SCREEN_GRID_N)
+            # Cell index uses (row=x-bin, col=y-bin) to match the "x=Vertical,
+            # y=Horizontal" axis-naming convention used above and in the thesis.
             for cx, cy in zip(hx, hy):
-                cell[cy * SCREEN_GRID_N + cx] += 1
+                cell[cx * SCREEN_GRID_N + cy] += 1
             occ.append(cell / cell.sum())
         return mean_x, mean_y, occ
 
