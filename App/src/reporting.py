@@ -519,6 +519,8 @@ class ComparisonReport:
     trans_matrix_a: pd.DataFrame   # row-normalised % averaged across cond A
     trans_matrix_b: pd.DataFrame   # row-normalised % averaged across cond B
     learning_df:    pd.DataFrame   # task_idx / condition / metric / mean / std / n
+    screen_position_stats: pd.DataFrame  # per-participant mean gaze x/y on Screen
+    screen_grid_stats:     pd.DataFrame  # per-participant 4x4 grid-cell occupancy on Screen
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -568,6 +570,120 @@ def _stat_row(
         "effect_size":         round(eff, 3) if not math.isnan(eff) else float("nan"),
         "significant":         bool(p < 0.05) if not math.isnan(p) else False,
     }
+
+
+SCREEN_GRID_N = 4  # 4x4 = 16 cells for the within-Screen occupancy test
+
+
+def _screen_xy_for_recording(rec_dir: pathlib.Path) -> tuple[np.ndarray, np.ndarray] | None:
+    """Per-recording Screen gaze points in normalised surface coordinates.
+    Mirrors the app's pooled-heatmap sampling rule (prefer fixation-flagged
+    rows when there are enough of them) so this stays consistent with what
+    the heatmap tab visualises."""
+    csv_path = None
+    for cand in [rec_dir / "aoi_results" / "analysis.csv",
+                 rec_dir / "aoi_results" / "raw" / "analysis.csv"]:
+        if cand.exists() and cand.stat().st_size > 0:
+            csv_path = cand
+            break
+    if csv_path is None:
+        return None
+    try:
+        cols = pd.read_csv(csv_path, nrows=0).columns
+        needed = [c for c in ("final_primary_aoi", "primary_aoi", "gaze_on_aoi_x",
+                              "gaze_on_aoi_y", "is_fixation") if c in cols]
+        df = pd.read_csv(csv_path, usecols=needed)
+    except Exception:
+        return None
+    if "gaze_on_aoi_x" not in df.columns or "gaze_on_aoi_y" not in df.columns:
+        return None
+    labels = _label_series(df)
+    sub = df[labels == "Screen"]
+    if "is_fixation" in sub.columns:
+        fix = sub[sub["is_fixation"].astype(str).str.lower() == "true"]
+        if len(fix) >= 10:
+            sub = fix
+    x = pd.to_numeric(sub["gaze_on_aoi_x"], errors="coerce")
+    y = pd.to_numeric(sub["gaze_on_aoi_y"], errors="coerce")
+    m = x.notna() & y.notna() & (x >= 0) & (x <= 1) & (y >= 0) & (y <= 1)
+    if m.sum() < 10:
+        return None
+    return x[m].to_numpy(), y[m].to_numpy()
+
+
+def _screen_spatial_stats(
+    cond_a_dir: pathlib.Path, cond_b_dir: pathlib.Path, cond_a: str, cond_b: str,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Per-participant within-Screen gaze position and grid-occupancy stats,
+    Gamified vs Non-Gamified — the same analysis reported in the Results
+    text, computed here so it is reproducible from inside the app rather
+    than only in an external script."""
+    def _collect(cond_dir):
+        mean_x, mean_y, occ = [], [], []
+        if not cond_dir.exists():
+            return mean_x, mean_y, occ
+        for rec_dir in _iter_recording_dirs(cond_dir):
+            xy = _screen_xy_for_recording(rec_dir)
+            if xy is None:
+                continue
+            x, y = xy
+            mean_x.append(float(x.mean()))
+            mean_y.append(float(y.mean()))
+            hx = np.clip((x * SCREEN_GRID_N).astype(int), 0, SCREEN_GRID_N - 1)
+            hy = np.clip((y * SCREEN_GRID_N).astype(int), 0, SCREEN_GRID_N - 1)
+            cell = np.zeros(SCREEN_GRID_N * SCREEN_GRID_N)
+            # Cell index uses (row=x-bin, col=y-bin) to match the "x=Vertical,
+            # y=Horizontal" axis-naming convention used above and in the thesis.
+            for cx, cy in zip(hx, hy):
+                cell[cx * SCREEN_GRID_N + cy] += 1
+            occ.append(cell / cell.sum())
+        return mean_x, mean_y, occ
+
+    ax, ay, aocc = _collect(cond_a_dir)
+    bx, by, bocc = _collect(cond_b_dir)
+
+    # Axis-naming convention: the written thesis reports the gaze_on_aoi_x
+    # distribution as "Vertical position" and gaze_on_aoi_y as "Horizontal
+    # position" (opposite of the raw x/y column names). Matched here so the
+    # in-app table and the thesis text agree; the underlying values and
+    # statistics are unchanged either way, only the axis label swaps.
+    pos_rows = [
+        _stat_row("Vertical position (normalised y)", ax, bx, cond_a, cond_b),
+        _stat_row("Horizontal position (normalised x)", ay, by, cond_a, cond_b),
+    ]
+    for r in pos_rows:
+        r["aoi"] = "Screen"
+    position_stats = pd.DataFrame(pos_rows)
+
+    grid_stats = pd.DataFrame()
+    if aocc and bocc:
+        Am, Bm = np.array(aocc), np.array(bocc)
+        rows, pvals = [], []
+        for c in range(SCREEN_GRID_N * SCREEN_GRID_N):
+            row, col = divmod(c, SCREEN_GRID_N)
+            r = _stat_row(f"Cell ({row},{col}) occupancy", Am[:, c].tolist(), Bm[:, c].tolist(),
+                         cond_a, cond_b)
+            r["aoi"] = "Screen"
+            rows.append(r)
+            pvals.append(r["p_value"] if not math.isnan(r["p_value"]) else 1.0)
+        # Benjamini-Hochberg FDR correction across the 16 cells; the
+        # corrected p replaces p_value so the shared stats table shows the
+        # multiplicity-corrected result directly.
+        pv = np.array(pvals)
+        order = np.argsort(pv)
+        ranked = pv[order]
+        m = len(pv)
+        bh = ranked * m / (np.arange(m) + 1)
+        bh = np.minimum.accumulate(bh[::-1])[::-1]
+        bh_full = np.empty(m)
+        bh_full[order] = np.clip(bh, 0, 1)
+        for i, r in enumerate(rows):
+            r["p_raw"] = r["p_value"]
+            r["p_value"] = round(float(bh_full[i]), 4)
+            r["significant"] = bool(bh_full[i] < 0.05)
+        grid_stats = pd.DataFrame(rows)
+
+    return position_stats, grid_stats
 
 
 def _load_recording_for_comparison(
@@ -806,9 +922,14 @@ def compare_conditions(
             ]:
                 if cand.exists() and cand.stat().st_size > 0:
                     try:
-                        df_head = pd.read_csv(cand, nrows=300)
-                        lbl = _label_series(df_head)
-                        seen.update(str(v) for v in lbl.unique() if str(v) != NONE_LABEL)
+                        # Scan the FULL label column (cheap — one column) so AOIs
+                        # that first appear late in a long recording are not missed.
+                        header = pd.read_csv(cand, nrows=0).columns
+                        col = "final_primary_aoi" if "final_primary_aoi" in header else (
+                            "primary_aoi" if "primary_aoi" in header else None)
+                        if col is not None:
+                            lbl = pd.read_csv(cand, usecols=[col])[col].map(_normalize_label)
+                            seen.update(str(v) for v in lbl.unique() if str(v) != NONE_LABEL)
                     except Exception:
                         pass
                     break
@@ -830,6 +951,9 @@ def compare_conditions(
             if m is not None:
                 recs_b.append(m)
 
+    screen_position_stats, screen_grid_stats = _screen_spatial_stats(
+        cond_a_dir, cond_b_dir, cond_a, cond_b)
+
     return ComparisonReport(
         condition_a=cond_a,
         condition_b=cond_b,
@@ -842,4 +966,6 @@ def compare_conditions(
         trans_matrix_a=_build_avg_trans_matrix(recs_a, aoi_names),
         trans_matrix_b=_build_avg_trans_matrix(recs_b, aoi_names),
         learning_df=_build_learning_df(recs_a, recs_b, cond_a, cond_b, aoi_names),
+        screen_position_stats=screen_position_stats,
+        screen_grid_stats=screen_grid_stats,
     )

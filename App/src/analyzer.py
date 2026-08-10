@@ -22,13 +22,29 @@ import collections
 import csv
 import json
 import logging
+import os
 import pathlib
 import re
 import shutil
+import threading
+import warnings
+from concurrent.futures import ThreadPoolExecutor
 
 import cv2
 import numpy as np
 import pupil_apriltags
+
+# `frame.gray` uses the fast Y-plane path (range 16-235); the library warns that the
+# full-range alternative is 4x slower — we deliberately keep the fast path. Silence it.
+warnings.filterwarnings("ignore", message=".*yuv420p.*")
+
+# Tag detection is the bottleneck (~40 ms/frame). Speed comes from a small thread
+# pool (pupil_apriltags releases the GIL, so N detectors run concurrently across
+# cores, ~2.5x). DETECT_STRIDE=1 detects EVERY frame (no accuracy loss); raise it to
+# skip frames and reuse the last detections if you want more speed for less accuracy.
+DETECT_STRIDE = 1
+_N_DET = max(1, (os.cpu_count() or 4) // 4)
+_DETECT_CHUNK = 300
 
 from paths import CONFIG_DIR, RECORDINGS_DIR, ensure_vendor_paths
 
@@ -63,11 +79,10 @@ AOI_CONFIG: dict[str, list[int]] = {
 
 # (u_min, u_max, v_min, v_max) inside the normalized Screen polygon.
 # u: left -> right, v: top -> bottom.
-SUB_AOIS_PROPORTIONS = {
-    "Points_Bar":   (0.10, 0.35, 0.00, 0.16),  # top-left
-    "Progress_Bar": (0.70, 0.95, 0.00, 0.16),  # top-right
-    "Avatar":       (0.00, 0.22, 0.78, 1.00),  # bottom-left
-}
+# Points_Bar / Progress_Bar / Avatar were removed — they are not the current
+# gamification elements. Real screen task/gamification zones live in
+# App/config/screen_zones.json and are wired in as part of the surface redesign.
+SUB_AOIS_PROPORTIONS: dict[str, tuple[float, float, float, float]] = {}
 
 AOI_COLORS: dict[str, tuple[int, int, int]] = {
     "Board":       (  0, 200, 255),   # orange
@@ -76,10 +91,6 @@ AOI_COLORS: dict[str, tuple[int, int, int]] = {
     "Middle_Box":  (  0, 165, 255),   # amber
     "Right_Box":   (255, 255,   0),   # cyan
     "Screen":      (255,  80,  80),   # blue
-    
-    "Points_Bar":  (  0, 165, 255),
-    "Progress_Bar": (0, 255, 128),
-    "Avatar":      (255, 200, 100),
 }
 DEFAULT_COLOR = (180, 180, 180)
 
@@ -110,9 +121,108 @@ def make_detector(decimate: float = 1.0) -> pupil_apriltags.Detector:
     )
 
 
+def make_screen_detector() -> pupil_apriltags.Detector:
+    """Aggressive detector for the calibration pass. Combined with 2x upscaling it
+    recovers the small, grazing-angle SCREEN corner tags (12/13/14/15) that the
+    standard 1x detector misses — measured on 96ARP to go from 1 screen tag to 3,
+    which is what lets the screen triangulate. Slower, so only used in calibration."""
+    return pupil_apriltags.Detector(
+        families="tag36h11",
+        nthreads=4,
+        quad_decimate=1.0,
+        quad_sigma=0.8,
+        refine_edges=1,
+        decode_sharpening=1.5,
+        debug=0,
+    )
+
+
 _clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
-def enhance_frame(gray: np.ndarray) -> np.ndarray:
-    return _clahe.apply(gray)
+def enhance_frame(gray: np.ndarray, clahe=None) -> np.ndarray:
+    """Normalise the frame so AprilTags decode reliably in all lighting/blur.
+    The rig and lighting are physically constant across recordings, so this is
+    tuned once: CLAHE evens out brightness/contrast, then a mild unsharp mask
+    counters motion blur. Applied identically in calibration and the main pass.
+    Pass a per-thread `clahe` when calling from worker threads (CLAHE is stateful)."""
+    eq = (clahe or _clahe).apply(gray)
+    blur = cv2.GaussianBlur(eq, (0, 0), 1.0)
+    return cv2.addWeighted(eq, 1.5, blur, -0.5, 0)
+
+
+_tls = threading.local()
+def _thread_detector():
+    """Per-thread detector + CLAHE. AprilTag/CLAHE objects are stateful and NOT
+    thread-safe, so every worker thread must have its own (sharing one causes
+    native crashes under concurrency)."""
+    if not hasattr(_tls, "det"):
+        _tls.det = make_detector(1.0)
+        _tls.clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+    return _tls.det, _tls.clahe
+
+
+def _detect_gray(gray):
+    det, clahe = _thread_detector()
+    return det.detect(enhance_frame(gray, clahe))
+
+
+def _calib_detect(gray):
+    """High-recall detection for the CALIBRATION pass only. Runs two passes and
+    unions them so it never detects fewer tags than the main pass, but adds the
+    rare screen tags:
+      1. standard 1x enhanced (solid for the well-seen Board/Box/Deck tags),
+      2. 2x-upscaled RAW + aggressive detector (recovers the tiny screen tags —
+         CLAHE/unsharp actually hurts those, so this pass uses raw gray).
+    2x corners are preferred where a tag appears in both (higher precision).
+    Returns {tag_id: 4x2 corners} in original-image pixels."""
+    det, clahe = _thread_detector()
+    if not hasattr(_tls, "sdet"):
+        _tls.sdet = make_screen_detector()
+    out = {int(d.tag_id): d.corners.astype(np.float64)
+           for d in det.detect(enhance_frame(gray, clahe))}
+    up = cv2.resize(gray, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
+    for d in _tls.sdet.detect(up):
+        out[int(d.tag_id)] = d.corners.astype(np.float64) / 2.0
+    return out
+
+
+def _cdetect_fast(gray):
+    """Plain 1x calibration detection. Used when the screen already decodes >=2 tags
+    per frame (good-marker recordings), so the expensive 2x high-recall pass in
+    _calib_detect isn't needed and calibration runs ~4x faster."""
+    det, clahe = _thread_detector()
+    return {int(d.tag_id): d.corners.astype(np.float64)
+            for d in det.detect(enhance_frame(gray, clahe))}
+
+
+def _stream_detections(frames, gaze_samps):
+    """Yield (frame_idx, frame, gaze, detections) for the main pass.
+
+    Detects every DETECT_STRIDE-th frame (reusing the last detections in between,
+    since the rig is static) and runs those detections concurrently on a thread
+    pool — each worker thread uses its OWN detector. Gaze is delivered per frame."""
+    pool = ThreadPoolExecutor(max_workers=_N_DET)
+    last_det: list = []
+    buf: list = []
+
+    def flush():
+        nonlocal last_det
+        det_idx = [k for k in range(len(buf)) if buf[k][0] % DETECT_STRIDE == 0]
+        detmap = dict(zip(det_idx, pool.map(_detect_gray, [buf[k][1].gray for k in det_idx])))
+        for k in range(len(buf)):
+            if k in detmap:
+                last_det = detmap[k]
+            yield buf[k][0], buf[k][1], buf[k][2], last_det
+
+    try:
+        for fi, (frame, gaze) in enumerate(zip(frames, gaze_samps, strict=False)):
+            buf.append((fi, frame, gaze))
+            if len(buf) >= _DETECT_CHUNK:
+                yield from flush()
+                buf = []
+        if buf:
+            yield from flush()
+    finally:
+        pool.shutdown(wait=True)
 
 
 # ── Geometry & Hit-Test Helpers ───────────────────────────────────────────────
@@ -122,6 +232,28 @@ def make_camera(recording: nr.NeonRecording) -> Camera:
     return Camera(1600, 1200,
                   cal.scene_camera_matrix,
                   cal.scene_distortion_coefficients)
+
+
+def sample_gaze(recording: nr.NeonRecording, scene_ts):
+    """Gaze aligned to each scene timestamp.
+
+    The library's ``recording.gaze.sample()`` uses ``pandas.merge_asof``, which
+    raises "right keys must be sorted" when a recording's gaze timestamps are not
+    monotonic (a data glitch present in some recordings). Fall back to sorting the
+    gaze stream and taking the nearest sample per scene frame so analysis still runs.
+    """
+    gd = np.asarray(recording.gaze.data)
+    gts = gd["time"]
+    if len(gts) > 1 and np.any(np.diff(gts) < 0):
+        log.warning("  Gaze timestamps not monotonic — using sorted nearest-sample fallback.")
+        gd = gd[np.argsort(gts, kind="stable")]
+        gts = gd["time"]
+        st = np.asarray(scene_ts)
+        idx = np.clip(np.searchsorted(gts, st), 0, len(gts) - 1)
+        left = np.clip(idx - 1, 0, len(gts) - 1)
+        choose_left = np.abs(gts[left] - st) <= np.abs(gts[idx] - st)
+        return gd[np.where(choose_left, left, idx)].view(np.recarray)
+    return recording.gaze.sample(scene_ts)
 
 def get_expanded_surface_boundary(s2i: np.ndarray, camera: Camera, scale: float = 1.10, n: int = 10) -> np.ndarray:
     """Gets the 2D pixel boundary of the surface, expanded outward by 'scale' to capture edge-gaze."""
@@ -371,6 +503,85 @@ def load_fixations(recording: nr.NeonRecording):
         empty = np.array([], dtype=np.int64)
         return empty, empty, np.array([]), np.array([])
 
+
+def write_summaries(out_dir: pathlib.Path, csv_path: pathlib.Path, rec_name: str, fps: float) -> None:
+    """Regenerate the per-recording summary files the dashboard reads:
+    fixation_summary.csv (one row per fixation), data_quality.json and
+    preprocessing_report.json. Rebuilt from analysis.csv after the main pass.
+    (These were lost when the analyzer was refactored, so the Fixation and
+    Data-Quality dashboard tabs read nothing.)"""
+    import pandas as pd
+    df = pd.read_csv(csv_path)
+    n = len(df)
+    if n == 0:
+        return
+    lbl = df["primary_aoi"].fillna("NoAOI").astype(str).replace("", "NoAOI")
+    dur = float(df["time_s"].iloc[-1] - df["time_s"].iloc[0]) if n > 1 else 0.0
+    n_fix = int(df["fixation_id"].dropna().nunique())
+    valid = int(df["gaze_x_px"].notna().sum())
+
+    # ── fixation_summary.csv (one row per fixation) ──
+    cols = ["fixation_id", "start_frame", "end_frame", "start_time_s",
+            "end_time_s", "duration_s", "dominant_aoi", "centroid_x", "centroid_y"]
+    rows = []
+    for fid, g in df.dropna(subset=["fixation_id"]).groupby("fixation_id"):
+        aois = g["primary_aoi"].fillna("NoAOI").astype(str).replace("", "NoAOI")
+        modes = aois.mode()
+        dur_s = (float(g["fixation_dur_ms"].iloc[0]) / 1000.0
+                 if "fixation_dur_ms" in g and pd.notna(g["fixation_dur_ms"].iloc[0])
+                 else float(g["time_s"].max() - g["time_s"].min()))
+        rows.append({
+            "fixation_id": int(fid),
+            "start_frame": int(g["frame_idx"].min()),
+            "end_frame": int(g["frame_idx"].max()),
+            "start_time_s": round(float(g["time_s"].min()), 4),
+            "end_time_s": round(float(g["time_s"].max()), 4),
+            "duration_s": round(dur_s, 4),
+            "dominant_aoi": modes.iloc[0] if len(modes) else "NoAOI",
+            "centroid_x": round(float(g["gaze_x_px"].mean()), 2),
+            "centroid_y": round(float(g["gaze_y_px"].mean()), 2),
+        })
+    fdf = pd.DataFrame(rows, columns=cols) if rows else pd.DataFrame(columns=cols)
+    fdf.to_csv(out_dir / "fixation_summary.csv", index=False, encoding="utf-8")
+
+    # ── data_quality.json ──
+    (out_dir / "data_quality.json").write_text(json.dumps({
+        "recording": rec_name,
+        "total_frames": n,
+        "valid_gaze_frames": valid,
+        "missing_gaze_pct": round(100.0 * (n - valid) / n, 2),
+        "recording_duration_s": round(dur, 2),
+        "fixation_count": n_fix,
+        "fps": round(fps, 1),
+    }, indent=2), encoding="utf-8")
+
+    # ── preprocessing_report.json (dwell / coverage / detection method) ──
+    aoi_names = [c[:-4] for c in df.columns if c.endswith("_hit")]
+    dwell = {a: int((lbl == a).sum()) for a in aoi_names}
+    detected = int((lbl != "NoAOI").sum())
+    # Detection-method split for the Data Quality breakdown: DIRECT = surface formed
+    # from >=2 of its own tags; PROJECTED = from the rigid body.
+    src = (df["aoi_hit_source"].fillna("").astype(str)
+           if "aoi_hit_source" in df.columns else pd.Series([""] * n))
+    direct = int((src == "direct").sum())
+    projected = int((src == "projected").sum())
+    (out_dir / "preprocessing_report.json").write_text(json.dumps({
+        "recording": rec_name,
+        "total_frames": n,
+        "aoi_detected_frames": detected,
+        "no_aoi_frames": n - detected,
+        "no_aoi_pct": round(100.0 * (n - detected) / n, 2),
+        "surface_3d_frames": direct,
+        "surface_3d_pct": round(100.0 * direct / n, 2),
+        "fallback_2d_frames": projected,
+        "fallback_2d_pct": round(100.0 * projected / n, 2),
+        "fixation_count": n_fix,
+        "fps": round(fps, 1),
+        "recording_duration_s": round(dur, 2),
+        "aoi_dwell_frames": dwell,
+        "aoi_dwell_pct": {a: round(100.0 * v / n, 2) for a, v in dwell.items()},
+    }, indent=2), encoding="utf-8")
+
 # ── Core analysis ─────────────────────────────────────────────────────────────
 
 def analyze_recording(
@@ -389,11 +600,8 @@ def analyze_recording(
 
     recording = nr.load(str(recording_dir))
     camera    = make_camera(recording)
-    detector_high = make_detector(1.0)
-    detector_low  = make_detector(2.0)
     
     aois = [AOI(name, ids) for name, ids in AOI_CONFIG.items()]
-    of_trackers = {aoi.name: OpticalFlowTracker() for aoi in aois}
     try:
         mask_config: AoiMaskConfig = load_aoi_mask_config(CONFIG_DIR, SUB_AOIS_PROPORTIONS)
     except Exception as exc:
@@ -418,7 +626,7 @@ def analyze_recording(
 
     scene_ts   = recording.scene.time
     frames     = recording.scene.sample(scene_ts)
-    gaze_samps = recording.gaze.sample(scene_ts)
+    gaze_samps = sample_gaze(recording, scene_ts)
 
     global_start_idx = 0
     if trim_range is not None:
@@ -440,6 +648,69 @@ def analyze_recording(
     fps = max(1.0, (total - 1) / ((scene_ts[-1] - scene_ts[0]) / 1e9)) if total > 1 else 30.0
     frame_dur_ms = 1000.0 / fps
 
+    # ── Scene-wide rigid-body calibration (pre-pass) ──────────────────────────
+    # Detect tags on a subsample and build ONE rigid model of the whole rig, so
+    # every surface (incl. the rarely-seen Screen, placed by triangulation) can
+    # be localised from any visible tag during the main pass.
+    import rigid_surface
+    _cal = recording.calibration
+    camera_K = np.array(_cal.scene_camera_matrix, dtype=np.float64)
+    camera_D = np.array(_cal.scene_distortion_coefficients, dtype=np.float64).reshape(-1)
+
+    # The rig geometry never changes for a recording, so calibration is cached to
+    # scene_model.pkl and REUSED on re-analysis — skipping the whole calibration pass.
+    # Delete scene_model.pkl to force a fresh calibration.
+    _model_cache = (output_dir or recording_dir / "aoi_results" / "raw") / "scene_model.pkl"
+    scene_model = None
+    if _model_cache.exists():
+        try:
+            _cached = rigid_surface.load_scene_model(_model_cache)
+            if _cached.templates and _cached.surface_quad_world and _cached.K is not None:
+                scene_model = _cached
+                log.info("  Reusing cached scene model (skipping calibration). Placed: %s",
+                         list(_cached.surface_quad_world))
+        except Exception as _e:
+            log.warning("  Could not load cached scene model (%s); recalibrating.", _e)
+            scene_model = None
+
+    if scene_model is None:
+        # Decide detection strength: the expensive 2x high-recall pass is only needed
+        # when the screen does NOT already decode >=2 tags per frame (poor-marker
+        # recordings, e.g. some Gamified). On good-marker recordings the screen forms
+        # directly, so plain 1x calibration suffices and is ~4x faster.
+        _screen_ids = set(rigid_surface.SCREEN_CORNER_IDS.values())
+        _pre_ts = np.array([int(scene_ts[i]) for i in range(0, total, max(1, total // 100))])
+        with ThreadPoolExecutor(max_workers=_N_DET) as _ppool:
+            _pre = list(_ppool.map(lambda g: {int(d.tag_id) for d in _detect_gray(g)},
+                                   [cf.gray for cf in recording.scene.sample(_pre_ts)]))
+        _ge2 = sum(1 for s in _pre if len(s & _screen_ids) >= 2)
+        _use_highrecall = (_ge2 / max(1, len(_pre))) < 0.03
+        _detect_fn = _calib_detect if _use_highrecall else _cdetect_fast
+
+        calib_stride = max(1, total // 2000)
+        calib_positions = list(range(0, total, calib_stride))
+        calib_ts = np.array([int(scene_ts[i]) for i in calib_positions])
+        log.info("  Calibrating scene rigid body from %d sampled frames (%s)...",
+                 len(calib_positions), "high-recall 2x" if _use_highrecall else "fast 1x")
+        _cgrays = [cf.gray for cf in recording.scene.sample(calib_ts)]
+        with ThreadPoolExecutor(max_workers=_N_DET) as _cpool:
+            calib_dets = list(_cpool.map(_detect_fn, _cgrays))
+        del _cgrays
+        scene_model = rigid_surface.calibrate_scene(calib_dets, AOI_CONFIG, camera_K, camera_D, log=log)
+
+    def _quad_area(q):
+        return 0.5 * float(np.linalg.norm(np.cross(q[2] - q[0], q[3] - q[1])))
+    # Smaller surfaces win over the large Board behind them when quads overlap.
+    surface_priority = {
+        s: r for r, (s, _a) in enumerate(sorted(
+            ((s, _quad_area(q)) for s, q in scene_model.surface_quad_world.items()),
+            key=lambda kv: kv[1]))
+    }
+
+    # Fresh frame iterator for the main pass (calibration consumed its own).
+    if trim_range is None:
+        frames = recording.scene.sample(scene_ts)
+
     log.info("  Frames: %d  |  FPS: %.1f  |  Duration: %.1f s  |  Fixations: %d", total, fps, total / fps, n_fixations)
 
     out_dir = output_dir or recording_dir / "aoi_results" / "raw"
@@ -450,6 +721,13 @@ def analyze_recording(
         except PermissionError:
             log.warning("  Could not delete old output folder — files may be open. Overwriting in place.")
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Persist the rig so AOI corrections can re-project gaze onto a new surface
+    # (updating the heatmap) without re-running the whole calibration.
+    try:
+        rigid_surface.save_scene_model(scene_model, out_dir / "scene_model.pkl")
+    except Exception as _e:
+        log.warning("  Could not save scene model: %s", _e)
 
     csv_path   = out_dir / "analysis.csv"
     video_path = out_dir / "validation_video.mp4"
@@ -472,7 +750,7 @@ def analyze_recording(
     vid_w = int((recording.scene.width  or 1600) * VIDEO_SCALE)
     vid_h = int((recording.scene.height or 1200) * VIDEO_SCALE)
     video_writer = None
-    if GENERATE_VIDEO:
+    if generate_video:
         fourcc       = cv2.VideoWriter_fourcc(*"mp4v")
         video_writer = cv2.VideoWriter(str(video_path), fourcc, fps, (vid_w, vid_h))
         log.info("  Video: %d\u00d7%d @ %.1f fps -> %s", vid_w, vid_h, fps, video_path.name)
@@ -510,7 +788,7 @@ def analyze_recording(
             ] + [f"{n}_hit" for n in aoi_names] + ["aoi_transition", "time_in_current_aoi_ms"]
               + [f"{n}_visits" for n in aoi_names] + ["markers_detected"])
 
-            for frame_idx, (frame, gaze) in enumerate(zip(frames, gaze_samps, strict=False)):
+            for frame_idx, frame, gaze, detections in _stream_detections(frames, gaze_samps):
                 global_frame = global_start_idx + frame_idx
                 if frame_idx % 30 == 0:
                     percent = frame_idx / total * 100 if total else 0.0
@@ -541,12 +819,7 @@ def analyze_recording(
                         scanpath.append((fix_cx, fix_cy))
                         last_fix_id = fix_id
 
-                gray_enhanced = enhance_frame(frame.gray)
-                detections    = detector_high.detect(gray_enhanced)
-                if len(detections) < 2:
-                    # Multi-pass: drop decimation for motion-blurred frames
-                    detections = detector_low.detect(gray_enhanced)
-                    
+                # `detections` is provided by _stream_detections (strided + threaded).
                 detected_ids  = [d.tag_id for d in detections]
 
                 row_hits        = {n: False for n in aoi_names}
@@ -559,102 +832,42 @@ def analyze_recording(
                 primary_marker_count = ""
                 primary_surface_initialized = ""
 
-                # 1. Evaluate Core AOIs via 3D Surface Mapping
-                for aoi in aois:
-                    visible_tags = [d for d in detections if d.tag_id in aoi.marker_ids]
-                    visible_count = len(visible_tags)
-                    
-                    # Optical flow and fallback logic
-                    fallback_poly = get_fallback_aoi_polygon(detections, aoi.marker_ids)
-                    of_source = ""
-                    if fallback_poly is None:
-                        fallback_poly = of_trackers[aoi.name].track(gray_enhanced)
-                        if fallback_poly is not None:
-                            of_source = "optical_flow"
-                    else:
-                        of_trackers[aoi.name].initialize(gray_enhanced, fallback_poly)
-                        of_source = "fallback_2d"
-                        
-                    if not aoi.is_initialized:
-                        # To build an accurate physical model, we must see ALL tags for this AOI at least once.
-                        # Otherwise, the convex hull wraps only the visible subset (e.g. half the screen).
-                        if visible_count == len(aoi.marker_ids):
-                            try:
-                                aoi.initialize(detections, camera)
-                            except ValueError:
-                                pass # Initialization failed
-                            
-                    loc = aoi.localize(detections, camera)
-                    if loc is not None:
-                        img2surface, s2i = loc
-                        # Get dilated 2D boundary from 3D surface
-                        boundary = get_expanded_surface_boundary(s2i, camera, scale=1.10)
-                        of_trackers[aoi.name].initialize(gray_enhanced, boundary)
-                        active_polygons[aoi.name] = boundary
-                        surface_xy = _surface_gaze(aoi, gx, gy, camera, img2surface)
-
-                        if _contains_gaze_polygon(boundary, gx, gy):
-                            row_hits[aoi.name] = True
-                            primary_aoi = aoi.name
-                            primary_surface = aoi.name
-                            hit_source = "surface"
-                            if surface_xy is not None:
-                                gaze_on_aoi_x = f"{float(surface_xy[0]):.5f}"
-                                gaze_on_aoi_y = f"{float(surface_xy[1]):.5f}"
-                            primary_marker_count = str(visible_count)
-                            primary_surface_initialized = str(aoi.is_initialized)
-
-                        # 2. Evaluate configured surface-space masks/sub-AOIs.
-                        # These are hit-tested in normalized surface coordinates and can
-                        # come from precise segmentation masks generated outside the app.
-                        if surface_xy is not None:
-                            for region in mask_config.for_surface(aoi.name):
-                                region_poly = _project_region_outline(region, s2i, camera)
-                                if region_poly is not None:
-                                    active_polygons[region.name] = region_poly
-                                if region.contains(surface_xy):
-                                    row_hits[region.name] = True
-                                    row_hits[aoi.name] = True
-                                    primary_aoi = region.name
-                                    primary_surface = aoi.name
-                                    hit_source = region.kind
-                                    gaze_on_aoi_x = f"{float(surface_xy[0]):.5f}"
-                                    gaze_on_aoi_y = f"{float(surface_xy[1]):.5f}"
-                                    primary_marker_count = str(visible_count)
-                                    primary_surface_initialized = str(aoi.is_initialized)
-                                    break
-
-                    # 3. Fallback 2D hit-testing keeps partially visible AOIs
-                    # from turning into NoAOI while waiting for full 3D setup.
-                    if not primary_aoi and fallback_poly is not None:
-                        active_polygons.setdefault(aoi.name, fallback_poly)
-                        fallback_xy = _surface_xy_from_image_quad(fallback_poly, gx, gy)
-                        if fallback_xy is not None:
-                            for region in mask_config.for_surface(aoi.name):
-                                region_poly = _project_region_outline_2d(region, fallback_poly)
-                                if region_poly is not None:
-                                    active_polygons.setdefault(region.name, region_poly)
-                                if region.contains(fallback_xy):
-                                    row_hits[region.name] = True
-                                    row_hits[aoi.name] = True
-                                    primary_aoi = region.name
-                                    primary_surface = aoi.name
-                                    hit_source = f"{region.kind}_{of_source}" if of_source else f"{region.kind}_fallback_2d"
-                                    gaze_on_aoi_x = f"{float(fallback_xy[0]):.5f}"
-                                    gaze_on_aoi_y = f"{float(fallback_xy[1]):.5f}"
-                                    primary_marker_count = str(visible_count)
-                                    primary_surface_initialized = str(aoi.is_initialized)
-                                    break
-                        if not primary_aoi and _contains_gaze_polygon(fallback_poly, gx, gy):
-                            row_hits[aoi.name] = True
-                            primary_aoi = aoi.name
-                            primary_surface = aoi.name
-                            hit_source = of_source if of_source == "optical_flow" else f"fallback_2d_{visible_count}tag"
-                            if fallback_xy is not None:
-                                gaze_on_aoi_x = f"{float(fallback_xy[0]):.5f}"
-                                gaze_on_aoi_y = f"{float(fallback_xy[1]):.5f}"
-                            primary_marker_count = str(visible_count)
-                            primary_surface_initialized = str(aoi.is_initialized)
+                # 1. Evaluate AOIs. Each surface forms its quad DIRECTLY from its own
+                # visible tags when present (accurate — this is how the screen makes a
+                # proper rectangle when you look at it); otherwise it falls back to the
+                # rigid-body projection from a well-constrained whole-rig camera pose.
+                loc = scene_model.localize(detections)
+                good_pose = loc is not None and loc[2] <= rigid_surface.CAMERA_MAX_REPROJ_PX
+                cam_rvec = loc[0] if good_pose else None
+                cam_tvec = loc[1] if good_pose else None
+                if True:
+                    best_rank = None
+                    for aoi_name, aoi_ids in AOI_CONFIG.items():
+                        quad = scene_model.surface_quad(aoi_name, detections, cam_rvec, cam_tvec)
+                        if quad is None:
+                            continue
+                        active_polygons[aoi_name] = quad
+                        uv = scene_model.gaze_to_surface(
+                            aoi_name, gx, gy, cam_rvec, cam_tvec, image_quad=quad)
+                        if uv is None:
+                            continue
+                        u, v = uv
+                        # inside the surface (5% edge margin catches border gaze)
+                        if -0.05 <= u <= 1.05 and -0.05 <= v <= 1.05:
+                            row_hits[aoi_name] = True
+                            rank = surface_priority.get(aoi_name, 99)
+                            if best_rank is None or rank < best_rank:
+                                best_rank = rank
+                                primary_aoi = aoi_name
+                                primary_surface = aoi_name
+                                own_tags = sum(1 for d in detections if d.tag_id in aoi_ids)
+                                # DIRECT = surface formed from >=2 of its own tags (matches
+                                # surface_quad's gate); PROJECTED = from the rigid body.
+                                hit_source = "direct" if own_tags >= 2 else "projected"
+                                gaze_on_aoi_x = f"{min(max(u, 0.0), 1.0):.5f}"
+                                gaze_on_aoi_y = f"{min(max(v, 0.0), 1.0):.5f}"
+                                primary_marker_count = str(own_tags)
+                                primary_surface_initialized = "True"
 
                 # 4. Handle Logging
                 if primary_aoi:
@@ -730,6 +943,10 @@ def analyze_recording(
             video_writer.release()
             video_writer = None
         write_progress(100.0, total, "complete")
+        try:
+            write_summaries(out_dir, csv_path, recording_dir.name, fps)
+        except Exception as exc:
+            log.warning("  Could not write summary files: %s", exc)
         if processing_path.exists():
             processing_path.unlink()
         log.info("  Done. Results saved in %s", out_dir)

@@ -140,9 +140,12 @@ def _enhance(gray: np.ndarray) -> np.ndarray:
     return gray  # identity — no pre-processing, same as analyzer
 
 def _make_detector() -> pupil_apriltags.Detector:
+    # Full-resolution detection (quad_decimate=1.0) to match the analyzer's
+    # high-precision detector. Downscaling (2.0) dropped small/far tags — most
+    # notably the screen tags — so the live overlay disagreed with the analysis.
     return pupil_apriltags.Detector(
         families="tag36h11", nthreads=4,
-        quad_decimate=2.0, quad_sigma=0.0,
+        quad_decimate=1.0, quad_sigma=0.0,
         refine_edges=1, decode_sharpening=0.5,
     )
 
@@ -232,6 +235,52 @@ class BatchAnalysisWorker(threading.Thread):
                     analyzer.analyze_recording(rec_dir, raw_dir, generate_video=False)
                 except Exception as e:
                     self.signals.status.emit(f"Failed {rec_dir.name}: {e}")
+            self.signals.finished.emit()
+        except Exception as exc:
+            self.signals.failed.emit(f"{type(exc).__name__}: {exc}")
+
+
+class WatcherWorker(threading.Thread):
+    """TEMPORARY: sweeps every recording under Recordings/ (both conditions) and
+    analyses the ones without an analysis.csv yet, in the background."""
+    def __init__(self, generation: int = 0) -> None:
+        super().__init__(daemon=True)
+        self.generation = generation
+        self.signals = WorkerSignals()
+        self._stop = threading.Event()
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def run(self) -> None:
+        try:
+            import analyzer
+            conds = sorted(p for p in RECORDINGS_DIR.iterdir() if p.is_dir()) if RECORDINGS_DIR.exists() else []
+            pending = []
+            for cond in conds:
+                for rec in sorted(p for p in cond.iterdir() if p.is_dir()):
+                    if not (rec / "info.json").exists():
+                        continue
+                    done = ((rec / "aoi_results" / "raw" / "analysis.csv").exists()
+                            or (rec / "aoi_results" / "analysis.csv").exists())
+                    if not done:
+                        pending.append(rec)
+            total = len(pending)
+            if total == 0:
+                self.signals.status.emit("Watcher: everything is already analysed.")
+                self.signals.finished.emit()
+                return
+            for i, rec in enumerate(pending, 1):
+                if self._stop.is_set():
+                    self.signals.status.emit("Watcher stopped.")
+                    break
+                self.signals.status.emit(f"Watcher {i}/{total}: {rec.name}")
+                raw = rec / "aoi_results" / "raw"
+                (raw / ".processing").unlink(missing_ok=True)
+                try:
+                    analyzer.analyze_recording(rec, raw, generate_video=False)
+                except Exception as e:
+                    self.signals.status.emit(f"Watcher failed {rec.name}: {e}")
             self.signals.finished.emit()
         except Exception as exc:
             self.signals.failed.emit(f"{type(exc).__name__}: {exc}")
@@ -601,7 +650,7 @@ class AOITimeline(QWidget):
     _ROW_GAZE     = 10
     _ROW_FIX      = 10
     _ROW_TASKS    = 20
-    _PAD          = 2
+    _PAD          = 0   # no gap between AOI / Gaze / Fix / Tasks lanes
     _LEFT_MARGIN  = 44   # pixels reserved on the left for row labels
 
     def __init__(self) -> None:
@@ -914,6 +963,7 @@ class TrimPanel(QWidget):
         self._start: Optional[int] = None
         self._end: Optional[int] = None
         self._current_frame = 0
+        self._undo_stack: list[tuple] = []
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -921,16 +971,20 @@ class TrimPanel(QWidget):
 
         btn_row = QHBoxLayout()
         btn_row.setSpacing(6)
-        self._in_btn = QPushButton("Set In")
-        self._out_btn = QPushButton("Set Out")
+        self._in_btn = QPushButton("In")
+        self._out_btn = QPushButton("Out")
         self._clear_btn = QPushButton("Clear")
         self._clear_btn.setObjectName("iconButton")
+        self._undo_btn = QPushButton("Undo")
+        self._undo_btn.setObjectName("iconButton")
         self._in_btn.setToolTip("Mark trim start at the current frame")
         self._out_btn.setToolTip("Mark trim end at the current frame")
         self._clear_btn.setToolTip("Remove trim — analyse the full recording")
+        self._undo_btn.setToolTip("Undo the last trim change")
         btn_row.addWidget(self._in_btn)
         btn_row.addWidget(self._out_btn)
         btn_row.addWidget(self._clear_btn)
+        btn_row.addWidget(self._undo_btn)
         layout.addLayout(btn_row)
 
         self._range_lbl = QLabel("Full recording (no trim)")
@@ -938,7 +992,7 @@ class TrimPanel(QWidget):
         self._range_lbl.setStyleSheet(f"color: {Theme.TEXT_FAINT}; font-size: 12px;")
         layout.addWidget(self._range_lbl)
         
-        self._crop_btn = QPushButton("✂ Crop CSV Data Now")
+        self._crop_btn = QPushButton("✂ Crop")
         self._crop_btn.setToolTip("Instantly remove all data outside the trimmed range from analysis.csv without re-running the slow analysis")
         self._crop_btn.setObjectName("secondaryButton")
         layout.addWidget(self._crop_btn)
@@ -959,24 +1013,37 @@ class TrimPanel(QWidget):
         self._in_btn.clicked.connect(self._set_in)
         self._out_btn.clicked.connect(self._set_out)
         self._clear_btn.clicked.connect(self._clear)
+        self._undo_btn.clicked.connect(self._undo)
         self._pad_spin.valueChanged.connect(lambda _: self._emit_changed())
 
     def set_current_frame(self, idx: int) -> None:
         self._current_frame = idx
 
+    def _push_undo(self) -> None:
+        self._undo_stack.append((self._start, self._end))
+
+    def _undo(self) -> None:
+        if not self._undo_stack:
+            return
+        self._start, self._end = self._undo_stack.pop()
+        self._refresh()
+
     def _set_in(self) -> None:
+        self._push_undo()
         self._start = self._current_frame
         if self._end is not None and self._end < self._start:
             self._end = None
         self._refresh()
 
     def _set_out(self) -> None:
+        self._push_undo()
         self._end = self._current_frame
         if self._start is not None and self._start > self._end:
             self._start = None
         self._refresh()
 
     def _clear(self) -> None:
+        self._push_undo()
         self._start = None
         self._end = None
         self._refresh()
@@ -1022,6 +1089,7 @@ class CorrectionPanel(QWidget):
     """Manual AOI relabelling for frames or a marked range."""
     correctionApplied = Signal(bool)  # True = apply marked range, False = current frame only
     correctionSaved = Signal()
+    undoRequested = Signal()
 
     def __init__(self) -> None:
         super().__init__()
@@ -1043,26 +1111,29 @@ class CorrectionPanel(QWidget):
         btn_row2 = QHBoxLayout()
         btn_row2.setSpacing(6)
         
-        self._frame_btn = QPushButton("Set Frame")
-        self._in_btn = QPushButton("Range In")
-        self._out_btn = QPushButton("Range Out")
-        self._apply_btn = QPushButton("Apply Range")
+        self._frame_btn = QPushButton("Frame")
+        self._in_btn = QPushButton("In")
+        self._out_btn = QPushButton("Out")
+        self._apply_btn = QPushButton("Apply")
         self._apply_btn.setObjectName("primaryButton")
-        self._save_btn = QPushButton("Save CSV")
-        
+        self._save_btn = QPushButton("Save")
+        self._undo_btn = QPushButton("Undo")
+
         self._frame_btn.setToolTip("Apply the selected AOI to the current frame")
         self._in_btn.setToolTip("Mark range start at the current frame")
         self._out_btn.setToolTip("Mark range end at the current frame")
         self._apply_btn.setToolTip("Apply the selected AOI to every frame in the marked range")
         self._save_btn.setToolTip("Save corrections back to analysis.csv (Updates dashboard)")
-        
+        self._undo_btn.setToolTip("Undo the last correction")
+
         btn_row1.addWidget(self._frame_btn)
         btn_row1.addWidget(self._in_btn)
         btn_row1.addWidget(self._out_btn)
-        
+
         btn_row2.addWidget(self._apply_btn)
+        btn_row2.addWidget(self._undo_btn)
         btn_row2.addWidget(self._save_btn)
-        
+
         layout.addLayout(btn_row1)
         layout.addLayout(btn_row2)
 
@@ -1076,6 +1147,7 @@ class CorrectionPanel(QWidget):
         self._out_btn.clicked.connect(self._set_out)
         self._apply_btn.clicked.connect(self._apply_range)
         self._save_btn.clicked.connect(self.correctionSaved.emit)
+        self._undo_btn.clicked.connect(self.undoRequested.emit)
 
     def set_current_frame(self, idx: int) -> None:
         self._current_frame = idx
@@ -1115,9 +1187,9 @@ class CorrectionPanel(QWidget):
         elif self._start is not None and self._end is not None:
             self._range_lbl.setText(f"Range: {self._start} → {self._end}")
         elif self._start is not None:
-            self._range_lbl.setText(f"Range in: {self._start}  (set Range Out)")
+            self._range_lbl.setText(f"In: {self._start}  (now set Out)")
         else:
-            self._range_lbl.setText(f"Range out: {self._end}  (set Range In)")
+            self._range_lbl.setText(f"Out: {self._end}  (now set In)")
 
     def active_range(self) -> tuple[Optional[int], Optional[int]]:
         return self._start, self._end
@@ -1356,12 +1428,14 @@ class DashboardWidget(QWidget):
 
         self._load_btn     = QPushButton("  Load  ")
         self._gen_btn      = QPushButton("  Rebuild  ")
-        self._png_btn      = QPushButton("📷  Save PNGs")
-        self._export_btn   = QPushButton("📗  Export Workbook")
+        self._png_btn      = QPushButton("📷  PNGs")
+        self._export_btn   = QPushButton("📗  Workbook")
 
         self._load_btn.setObjectName("primaryButton")
         self._load_btn.setToolTip("Load saved analysis for the selected recording")
         self._gen_btn.setToolTip("Force-rebuild all charts (same as Load but always regenerates)")
+        self._png_btn.setToolTip("Save every chart as a PNG image")
+        self._export_btn.setToolTip("Export all charts and tables to an Excel workbook")
 
         side_l.addWidget(QLabel("Difficulty:"))
         side_l.addWidget(self._diff_combo)
@@ -1481,6 +1555,15 @@ class DashboardWidget(QWidget):
 
     # ── Generate ──────────────────────────────────────────────────────────────
 
+    def reload(self) -> None:
+        """Re-read from disk and rebuild the current view (called after a Studio
+        edit/crop so the dashboard stays in sync). Silent no-op if not yet set up."""
+        try:
+            if self._diff_combo.count() > 0:
+                self._generate()
+        except Exception:
+            pass
+
     def _generate(self) -> None:
         src, rec_filter, csvs = self._collect_csvs()
         if src is None:
@@ -1540,22 +1623,54 @@ class DashboardWidget(QWidget):
 
         lbl_col = "final_primary_aoi" if "final_primary_aoi" in df.columns else "primary_aoi"
         df["_aoi"] = df[lbl_col].fillna(NONE_LABEL).astype(str)
-        total = len(df)
 
-        # Estimate fps from time_s column
+        # Estimate fps from the full recording's time_s (stable regardless of task).
         fps = 30.0
-        if "time_s" in df.columns and total > 1:
+        if "time_s" in df.columns and len(df) > 1:
             times = pd.to_numeric(df["time_s"], errors="coerce").dropna()
             dur = float(times.iloc[-1] - times.iloc[0]) if len(times) > 1 else 0.0
             if dur > 0:
                 fps = max(1.0, (len(times) - 1) / dur)
 
-        self._pop_dq_tab(rec_dir, df, total, fps)
-        self._pop_dwell_tab(df, total, fps)
-        self._pop_fixation_tab(rec_dir)
-        self._pop_heatmap_tab(df)
-        self._pop_transition_tab(df)
+        # Task filter drives EVERY tab: slice the per-frame data to the selected
+        # task's [start,end] frame range so dwell/fixation/heatmap/transition all
+        # reflect just that task (was previously applied to the Learning tab only).
+        bounds = self._load_task_bounds(rec_dir, task_filter)
+        dft = self._slice_task(df, bounds)
+        total = len(dft)
+
+        self._pop_dq_tab(rec_dir, dft, total, fps)
+        self._pop_dwell_tab(dft, total, fps)
+        self._pop_fixation_tab(rec_dir, bounds)
+        self._pop_heatmap_tab(dft)
+        self._pop_transition_tab(dft)
         self._pop_learning_tab(rec_dir, fps, task_filter)
+
+    @staticmethod
+    def _load_task_bounds(rec_dir: pathlib.Path, task_filter: str) -> tuple | None:
+        """(start_frame, end_frame) for the selected task, or None for All Tasks."""
+        if task_filter == "All Tasks":
+            return None
+        for p in [rec_dir / "aoi_results" / "tasks.json",
+                  rec_dir / "aoi_results" / "raw" / "tasks.json"]:
+            if p.exists():
+                try:
+                    td = json.loads(p.read_text(encoding="utf-8")).get(task_filter)
+                except Exception:
+                    return None
+                if isinstance(td, dict):
+                    s, e = td.get("start"), td.get("end")
+                    if s is not None and e is not None and int(e) > int(s):
+                        return int(s), int(e)
+                return None
+        return None
+
+    @staticmethod
+    def _slice_task(df: pd.DataFrame, bounds: tuple | None) -> pd.DataFrame:
+        if bounds is None or "frame_idx" not in df.columns:
+            return df
+        fi = pd.to_numeric(df["frame_idx"], errors="coerce")
+        return df[(fi >= bounds[0]) & (fi <= bounds[1])].copy()
 
     # ── Tab 1: Data Quality ───────────────────────────────────────────────────
 
@@ -1610,17 +1725,17 @@ class DashboardWidget(QWidget):
             det_section = f"""
 <div class='section'><h3>Detection Method Breakdown</h3>
 <table><tr><th>Method</th><th>Frames</th><th>%</th></tr>
-<tr><td>3D Surface Mapper</td><td>{pr.get('surface_3d_frames','—')}</td>
+<tr><td>Direct fit (own tags)</td><td>{pr.get('surface_3d_frames','—')}</td>
     <td>{pr.get('surface_3d_pct','—')}%</td></tr>
-<tr><td>2D Partial-marker Fallback</td><td>{pr.get('fallback_2d_frames','—')}</td>
+<tr><td>Rigid-body projected</td><td>{pr.get('fallback_2d_frames','—')}</td>
     <td>{pr.get('fallback_2d_pct','—')}%</td></tr>
 <tr><td>No Detection (NoAOI)</td><td>{pr.get('no_aoi_frames','—')}</td>
     <td>{pr.get('no_aoi_pct','—')}%</td></tr>
 </table>
 <p style='color:#5a5d63;font-size:12px;margin-top:10px;line-height:1.7'>
-3D Surface Mapper = highest accuracy (all markers visible).<br>
-2D Fallback = partial marker visibility, still classified.<br>
-NoAOI = insufficient markers or gaze outside defined areas.
+Direct fit = surface formed from ≥2 of its own visible tags (highest accuracy).<br>
+Rigid-body projected = surface located from other tags via the calibrated rig.<br>
+NoAOI = no reliable surface, or gaze outside every AOI.
 </p></div>"""
 
         html = f"""<!DOCTYPE html><html><head><meta charset='utf-8'>
@@ -1691,7 +1806,7 @@ td{{border-bottom:1px solid rgba(255,255,255,.04)}}
 
     # ── Tab 3: Fixation Metrics ───────────────────────────────────────────────
 
-    def _pop_fixation_tab(self, rec_dir: pathlib.Path) -> None:
+    def _pop_fixation_tab(self, rec_dir: pathlib.Path, bounds: tuple | None = None) -> None:
         view = self._rec_tab_views["fixations"]
         fix_path = None
         for p in [rec_dir / "aoi_results" / "raw" / "fixation_summary.csv",
@@ -1709,6 +1824,14 @@ td{{border-bottom:1px solid rgba(255,255,255,.04)}}
         except Exception as exc:
             view.setHtml(self._no_data_html(str(exc)))
             return
+
+        # Task filter: keep fixations whose start falls inside the task range.
+        if bounds is not None and "start_frame" in fdf.columns:
+            sf = pd.to_numeric(fdf["start_frame"], errors="coerce")
+            fdf = fdf[(sf >= bounds[0]) & (sf <= bounds[1])]
+            if fdf.empty:
+                view.setHtml(self._no_data_html("No fixations in the selected task range."))
+                return
 
         rows = []
         for aoi in AOI_NAMES:
@@ -1749,6 +1872,13 @@ td{{border-bottom:1px solid rgba(255,255,255,.04)}}
         aois_data = []
         for aoi in AOI_NAMES:
             sub  = df[df["_aoi"] == aoi]
+            # Attention heatmap: keep fixation frames only when available. Longer
+            # fixations span more frames, so this is inherently dwell-weighted, and
+            # saccade frames (gaze in flight) are dropped as noise.
+            if "is_fixation" in sub.columns:
+                fix = sub[sub["is_fixation"].astype(str).str.lower() == "true"]
+                if len(fix) >= 10:
+                    sub = fix
             x    = pd.to_numeric(sub["gaze_on_aoi_x"], errors="coerce").dropna().values
             y    = pd.to_numeric(sub["gaze_on_aoi_y"], errors="coerce").dropna().values
             mask = (x >= 0) & (x <= 1) & (y >= 0) & (y <= 1)
@@ -1890,36 +2020,112 @@ td{{border-bottom:1px solid rgba(255,255,255,.04)}}
             view.setHtml(self._no_data_html(f"No data for filter: {task_filter}"))
             return
 
-        fig = go.Figure()
+        # Errors render as a second panel DIRECTLY under the learning curve, sharing
+        # the Task 1-10 x-axis so repetitions line up vertically. If no errors were
+        # recorded, default to a zero series so the panel STILL shows (an error-free
+        # or not-yet-scored run reads as flat zeros, rather than hiding the panel).
+        series = _error_series(_load_errors_json(rec_dir))
+        if not series:
+            series = {int(ti): {"comp_type": 0, "comp_pos": 0, "cable_type": 0, "cable_pos": 0}
+                      for ti in tdf["task_idx"].tolist()}
+        has_err = self._has_errors(series)
+        if has_err:
+            fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.13,
+                                row_heights=[0.55, 0.45],
+                                subplot_titles=("Learning Curve — Task Duration",
+                                                "Assembly Errors per Task"))
+        else:
+            fig = make_subplots(rows=1, cols=1)
         fig.add_trace(go.Scatter(
-            x=tdf["task_idx"], y=tdf["dur_s"],
-            mode="lines+markers",
-            line=dict(width=2, color="#6e8fd6"),
-            marker=dict(size=8, color="#6e8fd6"),
-            customdata=tdf["task"].values,
+            x=tdf["task_idx"], y=tdf["dur_s"], mode="lines+markers",
+            line=dict(width=2, color="#6e8fd6"), marker=dict(size=8, color="#6e8fd6"),
+            customdata=tdf["task"].values, showlegend=False,
             hovertemplate="<b>%{customdata}</b><br>Duration: %{y:.1f}s<extra></extra>",
-        ))
-        # Trend line
+        ), row=1, col=1)
         if len(tdf) > 2:
             z = np.polyfit(tdf["task_idx"].values, tdf["dur_s"].values, 1)
             xr = np.linspace(tdf["task_idx"].min(), tdf["task_idx"].max(), 50)
-            fig.add_trace(go.Scatter(
-                x=xr, y=np.poly1d(z)(xr),
-                mode="lines",
+            fig.add_trace(go.Scatter(x=xr, y=np.poly1d(z)(xr), mode="lines",
                 line=dict(width=1.5, dash="dash", color="#333"),
-                showlegend=False, hoverinfo="skip",
-            ))
+                showlegend=False, hoverinfo="skip"), row=1, col=1)
         mean_dur = tdf["dur_s"].mean()
         fig.add_hline(y=mean_dur, line_dash="dot", line_color="#555",
                       annotation_text=f"Mean {mean_dur:.1f}s",
-                      annotation_position="bottom right")
-        fig.update_layout(
-            title="Learning Curve — Task Duration per Repetition",
-            xaxis=dict(title="Repetition", dtick=1),
-            yaxis_title="Duration (s)",
-            template="aoi_studio", autosize=True,
-            showlegend=False, margin=dict(t=50, b=40))
+                      annotation_position="bottom right", row=1, col=1)
+        fig.update_yaxes(title_text="Duration (s)", row=1, col=1)
+        layout = dict(template="aoi_studio", autosize=True, margin=dict(t=60, b=40))
+        if has_err:
+            buttons = self._add_error_traces(fig, series, row=2, n_prefix=len(fig.data))
+            fig.update_xaxes(title_text="Task", dtick=1, row=2, col=1)
+            fig.update_yaxes(title_text="Error count", row=2, col=1)
+            layout["updatemenus"] = [dict(type="buttons", direction="right", x=0.0, y=1.10,
+                                          xanchor="left", active=2, buttons=buttons)]
+            layout["height"] = 640
+        else:
+            fig.update_xaxes(title_text="Repetition", dtick=1, row=1, col=1)
+            fig.update_layout(title="Learning Curve — Task Duration per Repetition")
+        fig.update_layout(**layout)
         view.setHtml(self._fig_to_html(fig))
+
+    # ── Assembly-error traces (rendered UNDER the learning curve) ─────────────
+
+    @staticmethod
+    def _has_errors(series: dict) -> bool:
+        # Show the error panel whenever error data was recorded — even if every task
+        # is 0 (an error-free run is itself a result worth seeing beside the curve).
+        # Empty series (no errors.json at all) still hides it.
+        return bool(series)
+
+    def _agg_error_series(self, csvs: list[tuple[str, pathlib.Path]]) -> dict:
+        """Mean per-task error series across the given recordings."""
+        acc: dict[int, dict[str, list]] = {}
+        for _rec, csv_path in csvs:
+            series = _error_series(_load_errors_json(self._rec_dir_from_csv(csv_path)))
+            for t, v in series.items():
+                d = acc.setdefault(t, {"comp_type": [], "comp_pos": [], "cable_type": [], "cable_pos": []})
+                for k in d:
+                    d[k].append(v[k])
+        return {t: {k: (sum(vals) / len(vals) if vals else 0.0) for k, vals in d.items()}
+                for t, d in acc.items()}
+
+    def _add_error_traces(self, fig, series: dict, row: int, n_prefix: int) -> list:
+        """Add the 6 error traces to `fig` at `row`; return the Components/Cables/
+        All-Both toggle buttons (learning traces at indices <n_prefix stay visible)."""
+        tasks = sorted(series.keys())
+        ct = [series[t]["comp_type"] for t in tasks]
+        cp = [series[t]["comp_pos"] for t in tasks]
+        kt = [series[t]["cable_type"] for t in tasks]
+        kp = [series[t]["cable_pos"] for t in tasks]
+        comp_tot = [ct[i] + cp[i] for i in range(len(tasks))]
+        cable_tot = [kt[i] + kp[i] for i in range(len(tasks))]
+        # Each of the two traces shown in a view gets a contrasting dash + marker and a
+        # tiny opposite x-nudge, so when both are flat at 0 (an error-free run) they stay
+        # visibly distinct instead of collapsing into one line.
+        specs = [("Component · Type",     ct,        "#d4a24a", "solid", -0.08, "circle"),
+                 ("Component · Position", cp,        "#6fae7d", "dash",  +0.08, "square"),
+                 ("Cable · Type",         kt,        "#c07ba8", "solid", -0.08, "circle"),
+                 ("Cable · Position",     kp,        "#6e8fd6", "dash",  +0.08, "square"),
+                 ("Components (total)",   comp_tot,  "#d4a24a", "solid", -0.08, "circle"),
+                 ("Cables (total)",       cable_tot, "#6e8fd6", "dash",  +0.08, "square")]
+        for name, y, color, dash, xoff, sym in specs:
+            fig.add_trace(go.Scatter(x=[t + xoff for t in tasks], y=y, mode="lines+markers",
+                                     name=name, line=dict(color=color, dash=dash),
+                                     marker=dict(symbol=sym, size=8),
+                                     showlegend=True), row=row, col=1)
+        # Float the axis floor slightly below 0 so the line for an all-zero (error-free)
+        # run sits ABOVE the x-axis instead of lying on top of it.
+        ymax = max([0.0] + ct + cp + kt + kp + comp_tot + cable_tot)
+        top = max(1.0, ymax * 1.15)
+        pad = max(0.4, ymax * 0.06)
+        fig.update_yaxes(range=[-pad, top], dtick=(1 if top <= 12 else None),
+                         zeroline=True, row=row, col=1)
+        views = {"Components": [True, True, False, False, False, False],
+                 "Cables":     [False, False, True, True, False, False],
+                 "All / Both": [False, False, False, False, True, True]}
+        for i in range(6):
+            fig.data[n_prefix + i].visible = views["All / Both"][i]
+        return [dict(label=k, method="restyle", args=[{"visible": [True] * n_prefix + v}])
+                for k, v in views.items()]
 
     # ── Aggregate (multi-recording) tab population ────────────────────────────
 
@@ -1929,17 +2135,27 @@ td{{border-bottom:1px solid rgba(255,255,255,.04)}}
         return csv_path.parent.parent.parent if csv_path.parent.name == "raw" \
                else csv_path.parent.parent
 
+    def _agg_load(self, csv_path: pathlib.Path, task_filter: str):
+        """Read one recording's analysis, add _aoi, and slice to that recording's
+        own task range so aggregate tabs aggregate the SAME task across recordings.
+        Returns (sliced_df, bounds)."""
+        df = pd.read_csv(csv_path)
+        lbl_col = "final_primary_aoi" if "final_primary_aoi" in df.columns else "primary_aoi"
+        df["_aoi"] = df[lbl_col].fillna(NONE_LABEL).astype(str)
+        bounds = self._load_task_bounds(self._rec_dir_from_csv(csv_path), task_filter)
+        return self._slice_task(df, bounds), bounds
+
     def _generate_aggregate(self, csvs: list[tuple[str, pathlib.Path]],
                             task_filter: str) -> None:
         self._pop_agg_dq_tab(csvs)
         QApplication.processEvents()
-        self._pop_agg_dwell_tab(csvs)
+        self._pop_agg_dwell_tab(csvs, task_filter)
         QApplication.processEvents()
-        self._pop_agg_fixation_tab(csvs)
+        self._pop_agg_fixation_tab(csvs, task_filter)
         QApplication.processEvents()
-        self._pop_agg_heatmap_tab(csvs)
+        self._pop_agg_heatmap_tab(csvs, task_filter)
         QApplication.processEvents()
-        self._pop_agg_transition_tab(csvs)
+        self._pop_agg_transition_tab(csvs, task_filter)
         QApplication.processEvents()
         self._pop_agg_learning_tab(csvs, task_filter)
 
@@ -2053,16 +2269,16 @@ td{{border-bottom:1px solid rgba(255,255,255,.04)}}
 
     # ── Aggregate Tab 2: Dwell Time ───────────────────────────────────────────
 
-    def _pop_agg_dwell_tab(self, csvs: list[tuple[str, pathlib.Path]]):
+    def _pop_agg_dwell_tab(self, csvs: list[tuple[str, pathlib.Path]], task_filter: str = "All Tasks"):
         view = self._agg_tab_views["dwell"]
         dwell_rows: list[dict] = []
         fps = 30.0
         for rec_name, csv_path in csvs:
             try:
-                df = pd.read_csv(csv_path)
-                lbl_col = "final_primary_aoi" if "final_primary_aoi" in df.columns else "primary_aoi"
-                df["_aoi"] = df[lbl_col].fillna(NONE_LABEL).astype(str)
+                df, _b = self._agg_load(csv_path, task_filter)
                 total = max(1, len(df))
+                if total <= 1:
+                    continue
                 for aoi in AOI_NAMES:
                     cnt = int((df["_aoi"] == aoi).sum())
                     dwell_rows.append({"recording": rec_name, "AOI": aoi,
@@ -2106,16 +2322,20 @@ td{{border-bottom:1px solid rgba(255,255,255,.04)}}
 
     # ── Aggregate Tab 3: Fixation Metrics ─────────────────────────────────────
 
-    def _pop_agg_fixation_tab(self, csvs: list[tuple[str, pathlib.Path]]):
+    def _pop_agg_fixation_tab(self, csvs: list[tuple[str, pathlib.Path]], task_filter: str = "All Tasks"):
         view = self._agg_tab_views["fixations"]
         rows: list[dict] = []
         for rec_name, csv_path in csvs:
             rec_dir = self._rec_dir_from_csv(csv_path)
+            bounds = self._load_task_bounds(rec_dir, task_filter)
             for fix_path in [rec_dir / "aoi_results" / "raw" / "fixation_summary.csv",
                              rec_dir / "aoi_results" / "fixation_summary.csv"]:
                 if fix_path.exists() and fix_path.stat().st_size > 0:
                     try:
                         fdf = pd.read_csv(fix_path)
+                        if bounds is not None and "start_frame" in fdf.columns:
+                            sf = pd.to_numeric(fdf["start_frame"], errors="coerce")
+                            fdf = fdf[(sf >= bounds[0]) & (sf <= bounds[1])]
                         for aoi in AOI_NAMES:
                             aoi_rows = fdf[fdf["dominant_aoi"] == aoi]
                             rows.append({
@@ -2163,18 +2383,20 @@ td{{border-bottom:1px solid rgba(255,255,255,.04)}}
 
     # ── Aggregate Tab 4: AOI Heatmaps ─────────────────────────────────────────
 
-    def _pop_agg_heatmap_tab(self, csvs: list[tuple[str, pathlib.Path]]):
+    def _pop_agg_heatmap_tab(self, csvs: list[tuple[str, pathlib.Path]], task_filter: str = "All Tasks"):
         view = self._agg_tab_views["heatmaps"]
         aoi_gaze: dict[str, tuple[list, list]] = {a: ([], []) for a in AOI_NAMES}
         for _rec_name, csv_path in csvs:
             try:
-                df = pd.read_csv(csv_path)
+                df, _b = self._agg_load(csv_path, task_filter)
                 if "gaze_on_aoi_x" not in df.columns or "gaze_on_aoi_y" not in df.columns:
                     continue
-                lbl_col = "final_primary_aoi" if "final_primary_aoi" in df.columns else "primary_aoi"
-                df["_aoi"] = df[lbl_col].fillna(NONE_LABEL).astype(str)
                 for aoi in AOI_NAMES:
                     sub = df[df["_aoi"] == aoi]
+                    if "is_fixation" in sub.columns:
+                        fix = sub[sub["is_fixation"].astype(str).str.lower() == "true"]
+                        if len(fix) >= 10:
+                            sub = fix
                     x = pd.to_numeric(sub["gaze_on_aoi_x"], errors="coerce").dropna().values
                     y = pd.to_numeric(sub["gaze_on_aoi_y"], errors="coerce").dropna().values
                     mask = (x >= 0) & (x <= 1) & (y >= 0) & (y <= 1)
@@ -2222,14 +2444,13 @@ td{{border-bottom:1px solid rgba(255,255,255,.04)}}
 
     # ── Aggregate Tab 5: Transition Matrix ────────────────────────────────────
 
-    def _pop_agg_transition_tab(self, csvs: list[tuple[str, pathlib.Path]]):
+    def _pop_agg_transition_tab(self, csvs: list[tuple[str, pathlib.Path]], task_filter: str = "All Tasks"):
         view = self._agg_tab_views["transitions"]
         matrices: list[pd.DataFrame] = []
         for _rec_name, csv_path in csvs:
             try:
-                df = pd.read_csv(csv_path)
-                lbl_col = "final_primary_aoi" if "final_primary_aoi" in df.columns else "primary_aoi"
-                labels = df[lbl_col].fillna(NONE_LABEL).astype(str)
+                df, _b = self._agg_load(csv_path, task_filter)
+                labels = df["_aoi"]
                 matrix = pd.DataFrame(0, index=AOI_NAMES, columns=AOI_NAMES, dtype=int)
                 arr = labels.values
                 for i in range(len(arr) - 1):
@@ -2314,7 +2535,7 @@ td{{border-bottom:1px solid rgba(255,255,255,.04)}}
         if not task_rows:
             view.setHtml(self._no_data_html(
                 "No task annotations found.<br>"
-                "Annotate tasks T1–T10 in the Studio tab and click Save Tasks."))
+                "Annotate tasks T1–T10 in the Studio tab and click Save in the Tasks section."))
             return None
         tdf = pd.DataFrame(task_rows)
         if task_filter != "All Tasks":
@@ -2327,7 +2548,18 @@ td{{border-bottom:1px solid rgba(255,255,255,.04)}}
                .agg(mean="mean", std="std", median="median", n="count")
                .reset_index().sort_values("task_idx"))
         agg["std"] = agg["std"].fillna(0)
-        fig = go.Figure()
+        agg_err = self._agg_error_series(csvs)
+        if not agg_err:
+            agg_err = {int(ti): {"comp_type": 0, "comp_pos": 0, "cable_type": 0, "cable_pos": 0}
+                       for ti in agg["task_idx"].tolist()}
+        has_err = self._has_errors(agg_err)
+        if has_err:
+            fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.13,
+                                row_heights=[0.55, 0.45],
+                                subplot_titles=(f"Learning Curve — {n_recs} recording(s)",
+                                                "Mean Assembly Errors per Task"))
+        else:
+            fig = make_subplots(rows=1, cols=1)
         if n_recs > 1:
             x_l = agg["task_idx"].tolist()
             fig.add_trace(go.Scatter(
@@ -2337,36 +2569,36 @@ td{{border-bottom:1px solid rgba(255,255,255,.04)}}
                 fill="toself", fillcolor="rgba(88,166,255,0.12)",
                 line=dict(color="rgba(0,0,0,0)"),
                 showlegend=False, hoverinfo="skip",
-            ))
+            ), row=1, col=1)
             for rn, rg in tdf.groupby("recording"):
                 rg = rg.sort_values("task_idx")
                 fig.add_trace(go.Scatter(
-                    x=rg["task_idx"], y=rg["dur_s"],
-                    mode="lines+markers",
-                    line=dict(width=1, color="#3a3d43"),
-                    marker=dict(size=4),
+                    x=rg["task_idx"], y=rg["dur_s"], mode="lines+markers",
+                    line=dict(width=1, color="#3a3d43"), marker=dict(size=4),
                     name=rn, showlegend=False,
-                ))
+                ), row=1, col=1)
         fig.add_trace(go.Scatter(
-            x=agg["task_idx"], y=agg["mean"],
-            mode="lines+markers",
-            line=dict(width=3, color="#6e8fd6"),
-            marker=dict(size=8, color="#6e8fd6"),
-            name="Mean",
+            x=agg["task_idx"], y=agg["mean"], mode="lines+markers",
+            line=dict(width=3, color="#6e8fd6"), marker=dict(size=8, color="#6e8fd6"),
+            name="Mean", showlegend=False,
             customdata=np.stack([agg["median"], agg["std"], agg["n"]], axis=1),
-            hovertemplate=(
-                "Task %{x}<br>Mean: %{y:.1f}s<br>"
-                "Median: %{customdata[0]:.1f}s<br>"
-                "SD: %{customdata[1]:.1f}s<br>"
-                "n=%{customdata[2]}<extra></extra>"
-            ),
-        ))
-        fig.update_layout(
-            title=f"Learning Curve — Task Duration over Repetitions — {n_recs} recording(s)",
-            xaxis=dict(title="Task Number", dtick=1),
-            yaxis_title="Duration (s)",
-            template="aoi_studio", autosize=True,
-            showlegend=False, margin=dict(t=50, b=40))
+            hovertemplate=("Task %{x}<br>Mean: %{y:.1f}s<br>Median: %{customdata[0]:.1f}s<br>"
+                           "SD: %{customdata[1]:.1f}s<br>n=%{customdata[2]}<extra></extra>"),
+        ), row=1, col=1)
+        fig.update_yaxes(title_text="Duration (s)", row=1, col=1)
+        layout = dict(template="aoi_studio", autosize=True, margin=dict(t=60, b=40))
+        if has_err:
+            buttons = self._add_error_traces(fig, agg_err, row=2, n_prefix=len(fig.data))
+            fig.update_xaxes(title_text="Task", dtick=1, row=2, col=1)
+            fig.update_yaxes(title_text="Mean error count", row=2, col=1)
+            layout["updatemenus"] = [dict(type="buttons", direction="right", x=0.0, y=1.10,
+                                          xanchor="left", active=2, buttons=buttons)]
+            layout["height"] = 640
+        else:
+            fig.update_xaxes(title_text="Task Number", dtick=1, row=1, col=1)
+            fig.update_layout(showlegend=False,
+                title=f"Learning Curve — Task Duration over Repetitions — {n_recs} recording(s)")
+        fig.update_layout(**layout)
         view.setHtml(self._fig_to_html(fig))
         return fig
 
@@ -2751,6 +2983,35 @@ _REC_TAB_DEFS = [
     ("learning",     "Learning Curve"),
 ]
 
+# Roll-up of the 5 manual error fields into the graph's Type / Position axes.
+#   Type     = wrong identity  (component Type / cable Colour)
+#   Position = wrong placement (component Number+Orientation / cable Hole)
+def _error_series(errs: dict) -> dict:
+    """errs = {task_name: {field: count}} -> per task_idx sums for each series."""
+    out: dict[int, dict[str, float]] = {}
+    for tname, v in (errs or {}).items():
+        digits = "".join(c for c in str(tname) if c.isdigit())
+        if not digits:
+            continue
+        ti = int(digits)
+        g = out.setdefault(ti, {"comp_type": 0, "comp_pos": 0, "cable_type": 0, "cable_pos": 0})
+        g["comp_type"]  += float(v.get("comp_type", 0) or 0)
+        g["comp_pos"]   += float(v.get("comp_number", 0) or 0) + float(v.get("comp_orientation", 0) or 0)
+        g["cable_type"] += float(v.get("cable_colour", 0) or 0)
+        g["cable_pos"]  += float(v.get("cable_position", 0) or 0)
+    return out
+
+
+def _load_errors_json(rec_dir: pathlib.Path) -> dict:
+    for p in [rec_dir / "aoi_results" / "errors.json",
+              rec_dir / "aoi_results" / "raw" / "errors.json"]:
+        if p.exists():
+            try:
+                return json.loads(p.read_text(encoding="utf-8"))
+            except Exception:
+                return {}
+    return {}
+
 _TAB_DEFS = [
     ("01_dwell_pct",          "Dwell %"),
     ("02_fixation_count",     "Fixation Count"),
@@ -2804,10 +3065,12 @@ class ComparisonWidget(QWidget):
         self._cond_b_combo = QComboBox()
         self._cond_b_combo.setToolTip("Condition B (e.g. Gamified)")
 
-        self._run_btn = QPushButton("Run Comparison")
+        self._run_btn = QPushButton("Compare")
         self._run_btn.setObjectName("primaryButton")
+        self._run_btn.setToolTip("Run the statistical comparison between condition A and B")
 
-        self._png_btn = QPushButton("📷  Save PNGs")
+        self._png_btn = QPushButton("📷  PNGs")
+        self._png_btn.setToolTip("Save every comparison chart as a PNG image")
 
         side_l.addWidget(QLabel("Condition A:"))
         side_l.addWidget(self._cond_a_combo)
@@ -2821,7 +3084,7 @@ class ComparisonWidget(QWidget):
         side_l.addWidget(self._png_btn)
         side_l.addStretch(1)
 
-        self._status = QLabel("Select two conditions and click Run Comparison.")
+        self._status = QLabel("Select two conditions and click Compare.")
         self._status.setWordWrap(True)
         self._status.setStyleSheet(f"color: {Theme.TEXT_FAINT}; font-size: 12px;")
         side_l.addWidget(self._status)
@@ -3168,6 +3431,11 @@ class ComparisonWidget(QWidget):
         for df, section in [
             (report.aoi_stats,    "Per-AOI Metrics"),
             (report.overall_stats, "Overall Metrics"),
+            (getattr(report, "screen_position_stats", None),
+             "Screen — Mean Gaze Position (within-surface, per participant)"),
+            (getattr(report, "screen_grid_stats", None),
+             f"Screen — {reporting.SCREEN_GRID_N}x{reporting.SCREEN_GRID_N} Grid-Cell Occupancy "
+             "(per participant, Benjamini-Hochberg FDR-corrected p)"),
         ]:
             if df is None or df.empty:
                 continue
@@ -3326,33 +3594,123 @@ class CollapsibleBox(QWidget):
                 color: {Theme.TEXT};
             }}
         """)
-        self.toggle_button.setCheckable(True)
-        self.toggle_button.setChecked(False)  # False = open, True = closed? Wait, let's just make it a toggle
-        
-        # We will use text to show state: ▼ Title / ▶ Title
+        # Arrow in the text shows state: ▼ Title (open) / ▶ Title (collapsed).
+        # Sections start COLLAPSED — open only what you need.
         self._title = title
-        self.toggle_button.setText(f"▼  {self._title}")
+        self.toggle_button.setText(f"▶  {self._title}")
         self.toggle_button.clicked.connect(self.on_pressed)
 
         self.content_area = QWidget()
         self.content_layout = QVBoxLayout(self.content_area)
         self.content_layout.setContentsMargins(0, 8, 0, 8)
         self.content_layout.setSpacing(10)
+        self.content_area.setVisible(False)
 
         main_layout = QVBoxLayout(self)
         main_layout.setSpacing(0)
         main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.addWidget(self.toggle_button)
         main_layout.addWidget(self.content_area)
+        # Don't reserve vertical space when collapsed.
+        self.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
 
     def on_pressed(self):
+        # Toggle: if currently hidden, show it; if currently shown, hide it.
         is_collapsed = self.content_area.isHidden()
-        self.content_area.setVisible(not is_collapsed)
+        self.content_area.setVisible(is_collapsed)
         indicator = "▼" if is_collapsed else "▶"
         self.toggle_button.setText(f"{indicator}  {self._title}")
         
     def addWidget(self, widget, stretch=0):
         self.content_layout.addWidget(widget, stretch)
+
+
+# Manual assembly-error entry (filled by hand from the board photos, per task).
+ERROR_FIELDS = [
+    ("comp_number",      "Number / Gap"),
+    ("comp_type",        "Type"),
+    ("comp_orientation", "Orientation"),
+    ("cable_position",   "Position"),
+    ("cable_colour",     "Colour"),
+]
+
+
+class ErrorPanel(QWidget):
+    """Per-task assembly error counts (Components + Cables), entered manually."""
+    errorsChanged = Signal()
+    N_TASKS = 10
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._data = {f"Task {i}": {k: 0 for k, _ in ERROR_FIELDS}
+                      for i in range(1, self.N_TASKS + 1)}
+        self._current = "Task 1"
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(6)
+
+        row = QHBoxLayout(); row.setSpacing(6)
+        row.addWidget(QLabel("Task:"))
+        self._task_combo = QComboBox()
+        self._task_combo.addItems([f"Task {i}" for i in range(1, self.N_TASKS + 1)])
+        row.addWidget(self._task_combo, 1)
+        lay.addLayout(row)
+
+        self._spins: dict[str, QSpinBox] = {}
+
+        def section(title: str, keys: list[tuple[str, str]]) -> None:
+            t = QLabel(title); t.setObjectName("sectionTitle"); lay.addWidget(t)
+            for key, label in keys:
+                r = QHBoxLayout(); r.setSpacing(6)
+                lbl = QLabel(label)
+                lbl.setStyleSheet(f"font-size: 12px; color: {Theme.TEXT_MUTED};")
+                sp = QSpinBox(); sp.setRange(0, 999); sp.setFixedWidth(64)
+                sp.valueChanged.connect(self._on_value_changed)
+                r.addWidget(lbl, 1); r.addWidget(sp)
+                lay.addLayout(r)
+                self._spins[key] = sp
+
+        section("COMPONENTS", ERROR_FIELDS[:3])
+        section("CABLES", ERROR_FIELDS[3:])
+
+        self._task_combo.currentTextChanged.connect(self._on_task_changed)
+        self._refresh_spins()
+
+    def _on_task_changed(self, task: str) -> None:
+        self._current = task
+        self._refresh_spins()
+
+    def _refresh_spins(self) -> None:
+        vals = self._data.get(self._current, {})
+        for k, sp in self._spins.items():
+            sp.blockSignals(True)
+            sp.setValue(int(vals.get(k, 0)))
+            sp.blockSignals(False)
+
+    def _on_value_changed(self, _v: int) -> None:
+        d = self._data.setdefault(self._current, {k: 0 for k, _ in ERROR_FIELDS})
+        for k, sp in self._spins.items():
+            d[k] = sp.value()
+        self.errorsChanged.emit()
+
+    def get_errors(self) -> dict:
+        return {t: dict(v) for t, v in self._data.items()}
+
+    def load(self, data: dict) -> None:
+        if isinstance(data, dict):
+            for t, v in data.items():
+                if t in self._data and isinstance(v, dict):
+                    for k in self._data[t]:
+                        try:
+                            self._data[t][k] = int(v.get(k, 0) or 0)
+                        except (TypeError, ValueError):
+                            self._data[t][k] = 0
+        self._refresh_spins()
+
+    def reset(self) -> None:
+        self._data = {f"Task {i}": {k: 0 for k, _ in ERROR_FIELDS}
+                      for i in range(1, self.N_TASKS + 1)}
+        self._refresh_spins()
 
 
 class MainWindow(QMainWindow):
@@ -3374,19 +3732,82 @@ class MainWindow(QMainWindow):
         self._edit_sources: list[str] = []
         self._undo_stack: list[tuple[list[str], list[str], int]] = []
         self._analysis_worker: Worker | None = None
-        
+        # Bumped on each analysis run so stale worker callbacks are ignored.
+        self._analysis_generation = 0
+
+        # Playback state + timer. Dropped during the refactor; _set_playing()
+        # reads _play_timer/_playing/_speed, so loading a recording (which calls
+        # _set_playing(False)) crashed without these.
+        self._playing = False
+        self._speed = 1.0
+        self._play_timer = QTimer(self)
+        self._play_timer.timeout.connect(self._play_tick)
+
+        # Debounced auto-save of AOI corrections (writes straight into analysis.csv).
+        # Autosave persists LABELS ONLY (fast) so marking in/out never blocks the UI;
+        # the heavy re-projection/heatmap rebuild happens on the explicit Save button.
+        self._autosave_timer = QTimer(self)
+        self._autosave_timer.setSingleShot(True)
+        self._autosave_timer.timeout.connect(
+            lambda: self._save_corrections_to_disk(silent=True, heavy=False))
+
+        # Polls progress.json during analysis to fill the Analyse button.
+        self._progress_timer = QTimer(self)
+        self._progress_timer.timeout.connect(self._poll_analysis)
+
         # State variables for new logic
         self._trim: dict[str, Any] = {}
         self._tasks: dict[str, Any] = {}
         self._tabs = QTabWidget()
         self.setCentralWidget(self._tabs)
 
+        # Menu bar — batch/overnight analysis lives here, out of the workflow panel.
+        analyse_menu = self.menuBar().addMenu("Analyse")
+        self._batch_action = QAction("Analyse all in condition…", self)
+        self._batch_action.setToolTip("Re-run analysis on every recording in the current condition")
+        self._batch_action.triggered.connect(self._run_batch_analysis)
+        analyse_menu.addAction(self._batch_action)
+        # Validation video is slow to encode — off by default; toggle on to eyeball tracking.
+        self._gen_video_action = QAction("Generate validation video (slower)", self)
+        self._gen_video_action.setCheckable(True)
+        self._gen_video_action.setChecked(False)
+        self._gen_video_action.setToolTip("When on, Analyse also writes the overlay .mp4 (much slower)")
+        analyse_menu.addAction(self._gen_video_action)
+        analyse_menu.addSeparator()
+        self._watcher: Optional[WatcherWorker] = None
+        self._watcher_action = QAction("▶  Auto-analyse all pending (temporary)", self)
+        self._watcher_action.setToolTip("Background sweep: analyse every un-analysed recording across BOTH conditions while you work")
+        self._watcher_action.triggered.connect(self._toggle_watcher)
+        analyse_menu.addAction(self._watcher_action)
+
+        # Top-right corner (beside the tab bar): Save + Export + Help. Frees the
+        # lower-left panel and keeps the primary output actions always reachable.
         help_btn = QPushButton("?")
         help_btn.setObjectName("iconButton")
         help_btn.setFixedSize(26, 26)
         help_btn.setToolTip("Keyboard shortcuts")
         help_btn.clicked.connect(self._show_shortcuts_help)
-        self._tabs.setCornerWidget(help_btn, Qt.TopRightCorner)
+
+        self._save_tasks_btn = QPushButton("  Save")
+        self._save_tasks_btn.setIcon(_svg_icon("export.svg"))
+        self._save_tasks_btn.setIconSize(QSize(14, 14))
+        self._save_tasks_btn.setToolTip("Save task start/end annotations to disk")
+        self._save_tasks_btn.setEnabled(False)
+
+        self._export_btn = QPushButton("  Export")
+        self._export_btn.setObjectName("primaryButton")
+        self._export_btn.setIcon(_svg_icon("export.svg"))
+        self._export_btn.setIconSize(QSize(14, 14))
+        self._export_btn.setToolTip("Export the corrected AOI labels and tasks to a final CSV")
+
+        corner = QWidget()
+        corner_l = QHBoxLayout(corner)
+        corner_l.setContentsMargins(0, 0, 8, 0)
+        corner_l.setSpacing(6)
+        corner_l.addWidget(self._save_tasks_btn)
+        corner_l.addWidget(self._export_btn)
+        corner_l.addWidget(help_btn)
+        self._tabs.setCornerWidget(corner, Qt.TopRightCorner)
 
         # ── Studio tab ──────────────────────────────────────────────────────
         studio = QWidget()
@@ -3399,7 +3820,7 @@ class MainWindow(QMainWindow):
         # it (e.g. when 5-digit frame numbers crowd the task rows).
         left = QFrame()
         left.setObjectName("leftPanel")
-        left.setMinimumWidth(280)
+        left.setMinimumWidth(308)
         left_layout = QVBoxLayout(left)
         left_layout.setContentsMargins(16, 18, 16, 18)
         left_layout.setSpacing(12)
@@ -3440,8 +3861,17 @@ class MainWindow(QMainWindow):
         rec_row.addWidget(refresh_btn)
         left_layout.addLayout(rec_row)
 
-        self._load_btn = QPushButton("Load Recording")
+        # Filter the recording list by analysis status (🟢 analysed / ⚪ pending).
+        self._rec_filter_combo = QComboBox()
+        self._rec_filter_combo.addItem("All recordings", "all")
+        self._rec_filter_combo.addItem("● Analysed", "done")
+        self._rec_filter_combo.addItem("○ Pending", "pending")
+        self._rec_filter_combo.setToolTip("Show all recordings, only analysed, or only those still needing analysis")
+        left_layout.addWidget(self._rec_filter_combo)
+
+        self._load_btn = QPushButton("Load")
         self._load_btn.setObjectName("primaryButton")
+        self._load_btn.setToolTip("Load the selected recording into the player")
         left_layout.addWidget(self._load_btn)
 
         self._analyze_btn = QPushButton("  Analyse")
@@ -3451,32 +3881,19 @@ class MainWindow(QMainWindow):
         self._analyze_btn.setEnabled(False)
         left_layout.addWidget(self._analyze_btn)
 
-        self._batch_analyze_btn = QPushButton("  Batch Re-analyse All")
-        self._batch_analyze_btn.setIcon(_svg_icon("playbutton.svg"))
-        self._batch_analyze_btn.setIconSize(QSize(14, 14))
-        self._batch_analyze_btn.setToolTip("Re-run analysis on all recordings in current condition (generates new output files)")
-        self._batch_analyze_btn.setEnabled(True)
-        left_layout.addWidget(self._batch_analyze_btn)
 
+        # Progress is shown ON the Analyse button (fills as it processes), not a
+        # separate bar. Kept for compatibility but not placed in the panel.
         self._progress_bar = QProgressBar()
         self._progress_bar.setRange(0, 100)
-        self._progress_bar.setValue(0)
-        self._progress_bar.setTextVisible(True)
         self._progress_bar.hide()
-        left_layout.addWidget(self._progress_bar)
 
+        # Status lives in the window's bottom status bar, not as a panel info box.
         self._status_lbl = QLabel("No recording loaded.")
-        self._status_lbl.setObjectName("statusLabel")
-        self._status_lbl.setWordWrap(True)
-        left_layout.addWidget(self._status_lbl)
-
-        self._quality_lbl = QLabel("")
-        self._quality_lbl.setWordWrap(True)
-        self._quality_lbl.setStyleSheet(
-            "font-size: 10px; border-radius: 4px; padding: 4px 6px;"
-        )
+        self.statusBar().addWidget(self._status_lbl, 1)
+        self._quality_lbl = QLabel("")   # data-quality note (right of the status bar)
+        self.statusBar().addPermanentWidget(self._quality_lbl)
         self._quality_lbl.hide()
-        left_layout.addWidget(self._quality_lbl)
 
         _div1 = QFrame(); _div1.setFrameShape(QFrame.HLine); _div1.setObjectName("divider")
         left_layout.addWidget(_div1)
@@ -3503,23 +3920,20 @@ class MainWindow(QMainWindow):
         task_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         task_scroll.setStyleSheet("QScrollArea { border: none; background: transparent; }")
         task_scroll.setWidget(self._task_panel)
+        task_scroll.setMinimumHeight(200)   # visible when the section is expanded
         self._task_box.addWidget(task_scroll, 1)
+        left_layout.addWidget(self._task_box)
 
-        self._save_tasks_btn = QPushButton("  Save Tasks")
-        self._save_tasks_btn.setIcon(_svg_icon("export.svg"))
-        self._save_tasks_btn.setIconSize(QSize(14, 14))
-        self._save_tasks_btn.setEnabled(False)
-        self._task_box.addWidget(self._save_tasks_btn)
-        
-        left_layout.addWidget(self._task_box, 1)
+        # ── Assembly errors (manual entry from board photos) ──
+        self._error_box = CollapsibleBox("ERRORS")
+        self._error_panel = ErrorPanel()
+        self._error_box.addWidget(self._error_panel)
+        left_layout.addWidget(self._error_box)
 
-        # ── Export ──
-        self._export_box = CollapsibleBox("EXPORT")
-        self._export_btn = QPushButton("  Export Final CSV")
-        self._export_btn.setIcon(_svg_icon("export.svg"))
-        self._export_btn.setIconSize(QSize(14, 14))
-        self._export_box.addWidget(self._export_btn)
-        left_layout.addWidget(self._export_box)
+        # Collapsible sections stack from the top; slack goes to the bottom so a
+        # collapsed section doesn't leave a big gap.
+        left_layout.addStretch(1)
+        # Save + Export now live in the top-right corner (created above).
 
         # Right: video + controls, and timeline — split so the timeline's
         # height is freely user-resizable by dragging the splitter handle.
@@ -3566,16 +3980,24 @@ class MainWindow(QMainWindow):
         self._browse_rec_btn = browse_rec
         self._refresh_btn    = refresh_btn
 
+        # Apply the custom theme, connect every signal, and populate the source
+        # dropdowns. These were split into helpers during the refactor but the
+        # calls were dropped — without them the stylesheet never loads (boxy
+        # default look) and no button is connected.
+        self._apply_style()
+        self._wire()
+        self._refresh_sources()
+
     # ── Wire signals ─────────────────────────────────────────────────────────
 
     def _wire(self) -> None:
         self._src_combo.currentIndexChanged.connect(self._refresh_recordings)
+        self._rec_filter_combo.currentIndexChanged.connect(self._refresh_recordings)
         self._browse_src_btn.clicked.connect(self._browse_source)
         self._browse_rec_btn.clicked.connect(self._browse_recording)
         self._refresh_btn.clicked.connect(self._refresh_recordings)
         self._load_btn.clicked.connect(self._load_selected)
         self._analyze_btn.clicked.connect(self._run_analysis)
-        self._batch_analyze_btn.clicked.connect(self._run_batch_analysis)
         self._save_tasks_btn.clicked.connect(self._manual_save_tasks)
         self._export_btn.clicked.connect(self._export_final)
 
@@ -3589,7 +4011,11 @@ class MainWindow(QMainWindow):
 
         self._task_panel.tasksChanged.connect(self._on_tasks_changed)
         self._trim_panel.trimChanged.connect(self._on_trim_changed)
+        self._trim_panel._crop_btn.clicked.connect(self._on_crop_data_requested)
         self._correction_panel.correctionApplied.connect(self._on_correction_applied)
+        self._correction_panel.correctionSaved.connect(self._on_correction_saved)
+        self._correction_panel.undoRequested.connect(self._undo_correction)
+        self._error_panel.errorsChanged.connect(self._save_errors)
 
         # Shortcuts
         for key, fn in [
@@ -3600,6 +4026,11 @@ class MainWindow(QMainWindow):
             (Qt.Key_D,     lambda: self._video.step(1)),
             (Qt.Key_I,     self._task_panel._on_start),
             (Qt.Key_O,     self._task_panel._on_end),
+            # AOI correction — fast annotation
+            (Qt.Key_F,     self._correction_panel._apply_frame),   # apply AOI to current frame
+            (Qt.Key_J,     self._correction_panel._set_in),        # range In
+            (Qt.Key_K,     self._correction_panel._set_out),       # range Out
+            (Qt.Key_L,     self._correction_panel._apply_range),   # Apply range
         ]:
             act = QAction(self)
             act.setShortcut(key)
@@ -3621,14 +4052,37 @@ class MainWindow(QMainWindow):
         """Get the currently selected source directory."""
         return self._src_combo.currentData()
 
+    @staticmethod
+    def _is_analysed(d: pathlib.Path) -> bool:
+        return ((d / "aoi_results" / "raw" / "analysis.csv").exists() or
+                (d / "aoi_results" / "analysis.csv").exists())
+
     def _refresh_recordings(self) -> None:
+        prev = self._rec_combo.currentData()
+        self._rec_combo.blockSignals(True)
         self._rec_combo.clear()
         src: Optional[pathlib.Path] = self._src_combo.currentData()
-        if src is None or not src.exists():
-            return
-        for d in sorted(src.iterdir()):
-            if d.is_dir() and (d / "info.json").exists():
-                self._rec_combo.addItem(d.name, userData=d)
+        if src is not None and src.exists():
+            flt = self._rec_filter_combo.currentData()
+            for d in sorted(src.iterdir()):
+                if not (d.is_dir() and (d / "info.json").exists()):
+                    continue
+                done = self._is_analysed(d)
+                if flt == "done" and not done:
+                    continue
+                if flt == "pending" and done:
+                    continue
+                self._rec_combo.addItem(f"{'●' if done else '○'}  {d.name}", userData=d)
+                self._rec_combo.setItemData(
+                    self._rec_combo.count() - 1,
+                    QColor("#6fae7d") if done else QColor("#6a6d73"),
+                    Qt.ForegroundRole)
+        if prev is not None:                       # keep the current selection
+            for i in range(self._rec_combo.count()):
+                if self._rec_combo.itemData(i) == prev:
+                    self._rec_combo.setCurrentIndex(i)
+                    break
+        self._rec_combo.blockSignals(False)
 
     def _browse_source(self) -> None:
         path = QFileDialog.getExistingDirectory(self, "Select source folder", str(RECORDINGS_DIR))
@@ -3653,7 +4107,14 @@ class MainWindow(QMainWindow):
         if rec_dir:
             self._load_recording(rec_dir)
 
+    def _flush_autosave(self) -> None:
+        """Write any pending corrections for the CURRENT recording immediately."""
+        if getattr(self, "_autosave_timer", None) is not None and self._autosave_timer.isActive():
+            self._autosave_timer.stop()
+            self._save_corrections_to_disk(silent=True)
+
     def _load_recording(self, rec_dir: pathlib.Path) -> None:
+        self._flush_autosave()   # persist edits on the OUTGOING recording first
         self._status_lbl.setText("Loading…")
         QApplication.processEvents()
         try:
@@ -3689,19 +4150,19 @@ class MainWindow(QMainWindow):
             self._trim_panel.reset()
             self._trim = self._trim_panel.get_trim()
 
-            # Load existing analysis / tasks / trim / quality if available
+            # Load existing analysis / tasks / trim / quality / errors if available
             self._load_analysis_if_ready()
             self._load_tasks_from_disk()
             self._load_trim_from_disk()
             self._load_quality()
+            self._load_errors_from_disk()
 
             self._analyze_btn.setEnabled(True)
             self._save_tasks_btn.setEnabled(True)
             dur = n / self._fps
             self._status_lbl.setText(
-                f"{rec_dir.name}\n{n} frames  ·  "
-                f"{int(dur//3600)}:{int(dur%3600//60):02d}:{int(dur%60):02d}  ·  "
-                f"{self._fps:.0f} fps"
+                f"{rec_dir.name}  ·  {n} frames  ·  "
+                f"{int(dur//3600)}:{int(dur%3600//60):02d}:{int(dur%60):02d}  ·  {self._fps:.0f} fps"
             )
         except Exception as exc:
             self._status_lbl.setText(f"Load error: {exc}")
@@ -3710,6 +4171,7 @@ class MainWindow(QMainWindow):
     # ── Analysis ──────────────────────────────────────────────────────────────
 
     def _init_edit_state(self, n_frames: int, df: Optional[pd.DataFrame] = None) -> None:
+        self._reprojected = {}  # frame->label re-projection cache is per-recording
         self._edit_labels = list(self._csv_labels) if self._csv_labels else [NONE_LABEL] * n_frames
         if len(self._edit_labels) < n_frames:
             self._edit_labels.extend([NONE_LABEL] * (n_frames - len(self._edit_labels)))
@@ -3744,54 +4206,198 @@ class MainWindow(QMainWindow):
             frames = range(lo, hi + 1)
         else:
             frames = [self._video.frame_idx]
+        # Snapshot the affected frames so this correction can be undone one step.
+        snapshot = [(f, self._edit_labels[f], self._edit_sources[f])
+                    for f in frames if 0 <= f < len(self._edit_labels)]
+        if snapshot:
+            self._undo_stack.append(snapshot)
         for f in frames:
             if 0 <= f < len(self._edit_labels):
                 self._edit_labels[f] = aoi
                 self._edit_sources[f] = "manual"
-        display_labels = list(self._edit_labels)
+        self._refresh_correction_timeline()
+        self._schedule_autosave()
+        self._status_lbl.setText(f"Corrected {len(frames)} frame(s) → {aoi.replace('_', ' ')}")
+
+    def _refresh_correction_timeline(self) -> None:
         self._timeline.set_analysis(
-            display_labels,
+            list(self._edit_labels),
             self._timeline._gaze_x,
             self._timeline._gaze_y,
             self._timeline._fix_frames,
         )
-        self._status_lbl.setText(f"Corrected {len(frames)} frame(s) → {aoi.replace('_', ' ')}")
 
-    def _on_correction_saved(self) -> None:
+    def _undo_correction(self) -> None:
+        if not self._undo_stack:
+            self._status_lbl.setText("Nothing to undo.")
+            return
+        snapshot = self._undo_stack.pop()
+        for f, lbl, src in snapshot:
+            if 0 <= f < len(self._edit_labels):
+                self._edit_labels[f] = lbl
+                self._edit_sources[f] = src
+        self._refresh_correction_timeline()
+        self._schedule_autosave()
+        self._status_lbl.setText(f"Undid correction on {len(snapshot)} frame(s).")
+
+    # ── Correction persistence (overwrite primary_aoi in place + auto-save) ─────
+    def _schedule_autosave(self) -> None:
+        """Debounced auto-save so corrections are always on disk (no data loss)."""
+        self._autosave_timer.start(500)
+
+    def _save_corrections_to_disk(self, silent: bool = True, heavy: bool = False) -> None:
+        """Persist corrections to analysis.csv.
+
+        heavy=False (autosave): writes labels only — fast, never blocks the UI so
+        marking in/out stays responsive.
+        heavy=True (explicit Save): also re-projects gaze for the heatmap, rebuilds
+        the fixation/data-quality summaries, and reloads the dashboard. Runs under a
+        wait cursor and pumps events so the window never goes "Not Responding".
+        """
         if not self._rec_dir or not self._edit_labels:
             return
-            
+        # Guard against re-entry: a heavy Save pumps events, so a second click (or an
+        # autosave firing) must not start an overlapping save on the same file.
+        if getattr(self, "_saving", False):
+            return
+        self._saving = True
+        try:
+            self._do_save_corrections(silent=silent, heavy=heavy)
+        finally:
+            self._saving = False
+
+    def _do_save_corrections(self, silent: bool, heavy: bool) -> None:
         csv_path = self._rec_dir / "aoi_results" / "raw" / "analysis.csv"
         if not csv_path.exists():
-            QMessageBox.warning(self, APP_TITLE, "analysis.csv not found.")
+            csv_path = self._rec_dir / "aoi_results" / "analysis.csv"
+        if not csv_path.exists():
+            if not silent:
+                QMessageBox.warning(self, APP_TITLE, "analysis.csv not found.")
             return
-            
         try:
-            import pandas as pd
             df = pd.read_csv(csv_path)
-            
-            # Apply all manual corrections to the DataFrame
-            changes_made = 0
-            for i, (lbl, src) in enumerate(zip(self._edit_labels, self._edit_sources)):
-                if src == "manual" and i < len(df):
-                    df.at[i, "primary_aoi"] = lbl
-                    df.at[i, "aoi_hit_source"] = "manual"
-                    changes_made += 1
-                    
-            if changes_made > 0:
-                # Recalculate transitions
-                df['aoi_transition'] = df['primary_aoi'].ne(df['primary_aoi'].shift()) & df['primary_aoi'].notna()
-                # Ensure NoAOI doesn't count as a transition if coming from NoAOI (pandas shift handles this but just to be sure)
-                
-                df.to_csv(csv_path, index=False)
-                self._status_lbl.setText(f"Saved {changes_made} corrections to analysis.csv")
-                self._correction_panel._save_btn.setText("Saved ✓")
-                QTimer.singleShot(1500, lambda: self._correction_panel._save_btn.setText("Save CSV"))
+            # Rows are positioned by absolute frame_idx, so map edited frames to the
+            # correct rows (robust to trimmed/cropped CSVs).
+            if "frame_idx" in df.columns:
+                fi = pd.to_numeric(df["frame_idx"], errors="coerce").fillna(-1).astype(int)
+                pos = {f: r for r, f in enumerate(fi.tolist())}
             else:
-                self._status_lbl.setText("No manual corrections to save.")
-                
+                pos = {i: i for i in range(len(df))}
+            # Ensure string labels can be written even if the column was all-NaN (float).
+            for c in ("primary_aoi", "aoi_hit_source", "gaze_on_aoi_x", "gaze_on_aoi_y"):
+                if c in df.columns:
+                    df[c] = df[c].astype("object")
+            changes = 0
+            corrected: list[tuple[int, str]] = []
+            for f, (lbl, src) in enumerate(zip(self._edit_labels, self._edit_sources)):
+                if src == "manual" and f in pos:
+                    df.at[pos[f], "primary_aoi"] = lbl
+                    if "aoi_hit_source" in df.columns:
+                        df.at[pos[f], "aoi_hit_source"] = "manual"
+                    corrected.append((f, lbl))
+                    changes += 1
+            # Single source of truth is primary_aoi — drop any legacy correction column.
+            if "final_primary_aoi" in df.columns:
+                df = df.drop(columns=["final_primary_aoi"])
+            if "aoi_transition" in df.columns:
+                df["aoi_transition"] = df["primary_aoi"].ne(df["primary_aoi"].shift()) & df["primary_aoi"].notna()
+            # Heavy work only on explicit Save: re-project the corrected frames' gaze
+            # onto their NEW surface (heatmap), rebuild summaries, reload dashboard.
+            # Autosave (heavy=False) skips all of this so it stays instant.
+            if heavy:
+                QApplication.setOverrideCursor(Qt.WaitCursor)
+                try:
+                    self._reproject_corrected(df, pos, corrected)
+                    df.to_csv(csv_path, index=False)
+                    try:
+                        import analyzer
+                        analyzer.write_summaries(csv_path.parent, csv_path, self._rec_dir.name, self._fps)
+                    except Exception:
+                        pass
+                    self._dashboard.reload()
+                finally:
+                    QApplication.restoreOverrideCursor()
+            else:
+                df.to_csv(csv_path, index=False)
+            if not silent:
+                self._status_lbl.setText(f"Saved {changes} correction(s) to analysis.csv")
+                self._correction_panel._save_btn.setText("Saved ✓")
+                QTimer.singleShot(1200, lambda: self._correction_panel._save_btn.setText("Save"))
         except Exception as e:
-            QMessageBox.critical(self, APP_TITLE, f"Failed to save corrections: {e}")
+            if not silent:
+                QMessageBox.critical(self, APP_TITLE, f"Failed to save corrections: {e}")
+
+    def _reproject_corrected(self, df: pd.DataFrame, pos: dict, corrected: list) -> None:
+        """Recompute gaze_on_aoi_x/y for corrected frames by re-detecting the frame
+        and projecting the gaze onto the NEW surface (so the heatmap updates). Uses
+        the scene model saved during analysis; silently no-ops for older analyses."""
+        if not corrected or self._recording is None:
+            return
+        model_path = None
+        for p in [self._rec_dir / "aoi_results" / "raw" / "scene_model.pkl",
+                  self._rec_dir / "aoi_results" / "scene_model.pkl"]:
+            if p.exists():
+                model_path = p
+                break
+        if model_path is None or "gaze_on_aoi_x" not in df.columns:
+            return
+        try:
+            import rigid_surface, analyzer
+        except Exception:
+            return
+
+        class _D:
+            __slots__ = ("tag_id", "corners")
+            def __init__(self, t, c):
+                self.tag_id = t; self.corners = c
+
+        # Skip frames already re-projected for the same label so repeated Saves are cheap.
+        done = getattr(self, "_reprojected", None)
+        if done is None:
+            done = self._reprojected = {}
+        try:
+            model = rigid_surface.load_scene_model(model_path)
+            det = analyzer.make_detector(1.0)
+            scene_ts = self._recording.scene.time
+            todo = [(f, lbl) for f, lbl in corrected if done.get(f) != lbl]
+            total = len(todo)
+            for i, (f, lbl) in enumerate(todo):
+                # Pump the event loop so the window stays responsive during a long save.
+                if i % 6 == 0:
+                    self._status_lbl.setText(f"Updating heatmap… {i}/{total}")
+                    QApplication.processEvents()
+                if f not in pos:
+                    continue
+                r = pos[f]
+                done[f] = lbl
+                if lbl == NONE_LABEL:
+                    df.at[r, "gaze_on_aoi_x"] = ""
+                    df.at[r, "gaze_on_aoi_y"] = ""
+                    continue
+                if f >= len(scene_ts):
+                    continue
+                gx = pd.to_numeric(pd.Series([df.at[r, "gaze_x_px"]]), errors="coerce").iloc[0]
+                gy = pd.to_numeric(pd.Series([df.at[r, "gaze_y_px"]]), errors="coerce").iloc[0]
+                if not (np.isfinite(gx) and np.isfinite(gy)):
+                    continue
+                frame = next(iter(self._recording.scene.sample(np.array([int(scene_ts[f])]))))
+                dets = [_D(int(d.tag_id), d.corners.astype(np.float64))
+                        for d in det.detect(analyzer.enhance_frame(frame.gray))]
+                loc = model.localize(dets)
+                cr, ct = (loc[0], loc[1]) if loc else (None, None)
+                quad = model.surface_quad(lbl, dets, cr, ct)
+                if quad is None:
+                    continue
+                uv = model.gaze_to_surface(lbl, float(gx), float(gy), cr, ct, image_quad=quad)
+                if uv is not None:
+                    df.at[r, "gaze_on_aoi_x"] = f"{min(max(uv[0], 0.0), 1.0):.5f}"
+                    df.at[r, "gaze_on_aoi_y"] = f"{min(max(uv[1], 0.0), 1.0):.5f}"
+        except Exception:
+            pass
+
+    def _on_correction_saved(self) -> None:
+        # Save button = force an immediate (non-silent) save WITH heatmap re-projection.
+        self._save_corrections_to_disk(silent=False, heavy=True)
 
     def _run_analysis(self) -> None:
         if self._rec_dir is None:
@@ -3805,9 +4411,8 @@ class MainWindow(QMainWindow):
             lock = self._rec_dir / "aoi_results" / "raw" / ".processing"
             lock.unlink(missing_ok=True)
 
-        self._analyze_btn.setEnabled(False)
-        self._progress_bar.setValue(0)
-        self._progress_bar.show()
+        self._set_analyse_progress(0)
+        self._progress_timer.start(300)
         self._status_lbl.setText("Analysis running…")
 
         self._analysis_generation += 1
@@ -3815,7 +4420,7 @@ class MainWindow(QMainWindow):
         worker = AnalysisWorker(
             self._rec_dir,
             trim=self._trim_panel.get_trim(),
-            generate_video=False,  # Validation video removed (user request)
+            generate_video=self._gen_video_action.isChecked(),  # off by default (fast)
             generation=gen,
         )
         worker.signals.status.connect(self._status_lbl.setText)
@@ -3845,7 +4450,7 @@ class MainWindow(QMainWindow):
         if reply != QMessageBox.Yes:
             return
 
-        self._batch_analyze_btn.setEnabled(False)
+        self._batch_action.setEnabled(False)
         self._status_lbl.setText("Batch analysis starting…")
 
         self._analysis_generation += 1
@@ -3856,47 +4461,94 @@ class MainWindow(QMainWindow):
         worker.signals.failed.connect(lambda msg: self._on_batch_analysis_failed(msg, gen))
         worker.start()
 
+    def _toggle_watcher(self) -> None:
+        """TEMPORARY: start/stop a background sweep that analyses every pending
+        recording in both conditions while you keep working."""
+        if self._watcher is not None and self._watcher.is_alive():
+            self._watcher.stop()
+            self._watcher_action.setText("▶  Auto-analyse all pending (temporary)")
+            self._status_lbl.setText("Stopping watcher…")
+            return
+        self._watcher = WatcherWorker()
+        self._watcher.signals.status.connect(self._status_lbl.setText)
+        self._watcher.signals.finished.connect(self._on_watcher_done)
+        self._watcher.signals.failed.connect(
+            lambda m: self._status_lbl.setText(f"Watcher error: {m}"))
+        self._watcher_action.setText("■  Stop auto-analysis")
+        self._status_lbl.setText("Watcher started — analysing pending recordings in the background…")
+        self._watcher.start()
+
+    def _on_watcher_done(self) -> None:
+        self._watcher_action.setText("▶  Auto-analyse all pending (temporary)")
+        self._refresh_recordings()
+        self._status_lbl.setText("Watcher finished — pending recordings analysed.")
+
     def _on_batch_analysis_done(self, generation: int) -> None:
         if generation != self._analysis_generation:
             return
-        self._batch_analyze_btn.setEnabled(True)
+        self._batch_action.setEnabled(True)
+        self._refresh_recordings()   # update 🟢/⚪ status dots
         self._status_lbl.setText("Batch analysis complete. All recordings updated.")
         QMessageBox.information(self, APP_TITLE, "Batch analysis complete!\n\nAll recordings have been re-analysed with new output files.")
 
     def _on_batch_analysis_failed(self, msg: str, generation: int) -> None:
         if generation != self._analysis_generation:
             return
-        self._batch_analyze_btn.setEnabled(True)
+        self._batch_action.setEnabled(True)
         self._status_lbl.setText("Batch analysis failed.")
         QMessageBox.warning(self, APP_TITLE, f"Batch analysis failed:\n{msg}")
+
+    def _set_analyse_progress(self, pct: Optional[int]) -> None:
+        """Show analysis progress by filling the Analyse button; None = idle reset."""
+        if pct is None:
+            self._analyze_btn.setStyleSheet("")   # revert to global primaryButton style
+            self._analyze_btn.setText("  Analyse")
+            return
+        pct = max(0, min(100, int(pct)))
+        self._analyze_btn.setText(f"  Analysing… {pct}%")
+        s = pct / 100.0
+        e = min(s + 0.0001, 1.0)
+        self._analyze_btn.setStyleSheet(
+            "QPushButton {"
+            f" background: qlineargradient(x1:0, y1:0, x2:1, y2:0,"
+            f" stop:0 #7e9bdb, stop:{s:.4f} #7e9bdb,"
+            f" stop:{e:.4f} #333f5c, stop:1 #333f5c);"
+            " color:#ffffff; border:1px solid #6e8fd6; border-radius:8px;"
+            " padding:8px 12px; font-weight:600; }"
+        )
 
     def _poll_analysis(self) -> None:
         if self._rec_dir is None:
             return
-        progress_path = self._rec_dir / "aoi_results" / "raw" / "progress.json"
-        if progress_path.exists():
-            try:
-                data = json.loads(progress_path.read_text(encoding="utf-8"))
-                pct  = int(data.get("percent", 0))
-                self._progress_bar.setValue(pct)
-                self._progress_bar.show()
-            except Exception:
-                pass
+        for progress_path in (self._rec_dir / "aoi_results" / "raw" / "progress.json",
+                              self._rec_dir / "aoi_results" / "progress.json"):
+            if progress_path.exists():
+                try:
+                    data = json.loads(progress_path.read_text(encoding="utf-8"))
+                    self._set_analyse_progress(int(data.get("percent", 0)))
+                except Exception:
+                    pass
+                return
 
     def _on_analysis_done(self, generation: int) -> None:
         if generation != self._analysis_generation:
             return
+        self._progress_timer.stop()
+        self._set_analyse_progress(None)
         self._analyze_btn.setEnabled(True)
-        self._progress_bar.hide()
+        self._flush_autosave()   # never let a reload clobber unsaved corrections
         self._load_analysis_if_ready()
         self._load_quality()
+        self._refresh_recordings()   # update ●/○ status dots
+        self._dashboard.reload()     # keep dashboard in sync with the new analysis
         self._status_lbl.setText("Analysis complete.")
 
     def _on_analysis_failed(self, msg: str, generation: int) -> None:
         if generation != self._analysis_generation:
             return
+        self._progress_timer.stop()
+        self._set_analyse_progress(None)
         self._analyze_btn.setEnabled(True)
-        self._progress_bar.hide()
         self._status_lbl.setText(f"Analysis failed.")
         QMessageBox.warning(self, APP_TITLE, f"Analysis failed:\n{msg}")
 
@@ -4075,7 +4727,7 @@ class MainWindow(QMainWindow):
         self._tasks = self._task_panel.get_tasks()
         self._save_tasks_to_disk()
         self._save_tasks_btn.setText("  Saved ✓")
-        QTimer.singleShot(1800, lambda: self._save_tasks_btn.setText("  Save Tasks"))
+        QTimer.singleShot(1800, lambda: self._save_tasks_btn.setText("  Save"))
 
     def _load_tasks_from_disk(self) -> None:
         if self._rec_dir is None:
@@ -4147,9 +4799,32 @@ class MainWindow(QMainWindow):
                 fdf = fdf[(fdf['end_frame'] >= start_f) & (fdf['start_frame'] <= end_f)]
                 fdf.to_csv(raw_fix, index=False)
                 
-            QMessageBox.information(self, APP_TITLE, f"Successfully cropped data from {original_len} to {len(df)} frames.\n\nPlease click the 'Load' button in the Dashboard tab to refresh the charts!")
+            self._dashboard.reload()   # refresh charts automatically
+            QMessageBox.information(self, APP_TITLE, f"Cropped data from {original_len} to {len(df)} frames. Dashboard updated.")
         except Exception as e:
             QMessageBox.critical(self, APP_TITLE, f"Failed to crop data: {e}")
+
+    def _save_errors(self) -> None:
+        if self._rec_dir is None:
+            return
+        out = self._rec_dir / "aoi_results"
+        out.mkdir(parents=True, exist_ok=True)
+        (out / "errors.json").write_text(
+            json.dumps(self._error_panel.get_errors(), indent=2), encoding="utf-8")
+        self._dashboard.reload()
+
+    def _load_errors_from_disk(self) -> None:
+        self._error_panel.reset()
+        if self._rec_dir is None:
+            return
+        for p in [self._rec_dir / "aoi_results" / "errors.json",
+                  self._rec_dir / "aoi_results" / "raw" / "errors.json"]:
+            if p.exists():
+                try:
+                    self._error_panel.load(json.loads(p.read_text(encoding="utf-8")))
+                except Exception:
+                    pass
+                return
 
     def _load_trim_from_disk(self) -> None:
         if self._rec_dir is None:
@@ -4217,9 +4892,12 @@ class MainWindow(QMainWindow):
             "I — Mark start of selected task at current frame<br>"
             "O — Mark end of selected task at current frame<br>"
             "<br><b>AOI Correction</b><br>"
-            "Choose an AOI, then Set Frame or mark Range In/Out and Apply Range<br>"
+            "Choose an AOI, then Frame for one frame, or mark In/Out and Apply for a range<br>"
+            "F — Apply AOI to current frame<br>"
+            "J — Range In &nbsp;·&nbsp; K — Range Out &nbsp;·&nbsp; L — Apply range<br>"
+            "(corrections auto-save to analysis.csv)<br>"
             "<br><b>Trim</b><br>"
-            "Set In / Set Out buttons — Mark the analysis range at the current frame<br>"
+            "In / Out buttons — Mark the analysis range at the current frame<br>"
             "Clear — Remove trim, analyse the full recording"
         ))
 
