@@ -640,9 +640,14 @@ def _screen_spatial_stats(
     ax, ay, aocc = _collect(cond_a_dir)
     bx, by, bocc = _collect(cond_b_dir)
 
+    # Axis-naming convention: the written thesis reports the gaze_on_aoi_x
+    # distribution as "Vertical position" and gaze_on_aoi_y as "Horizontal
+    # position" (opposite of the raw x/y column names). Matched here so the
+    # in-app table and the thesis text agree; the underlying values and
+    # statistics are unchanged either way, only the axis label swaps.
     pos_rows = [
-        _stat_row("Vertical position (normalised y)", ay, by, cond_a, cond_b),
-        _stat_row("Horizontal position (normalised x)", ax, bx, cond_a, cond_b),
+        _stat_row("Vertical position (normalised y)", ax, bx, cond_a, cond_b),
+        _stat_row("Horizontal position (normalised x)", ay, by, cond_a, cond_b),
     ]
     for r in pos_rows:
         r["aoi"] = "Screen"
