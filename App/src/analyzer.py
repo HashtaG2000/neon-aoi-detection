@@ -46,16 +46,11 @@ DETECT_STRIDE = 1
 _N_DET = max(1, (os.cpu_count() or 4) // 4)
 _DETECT_CHUNK = 300
 
-from paths import CONFIG_DIR, RECORDINGS_DIR, ensure_vendor_paths
+from paths import RECORDINGS_DIR, ensure_vendor_paths
 
 ensure_vendor_paths()
 
 import pupil_labs.neon_recording as nr
-from pupil_labs.camera import Camera, perspective_transform
-from pupil_labs.marker_mapper.aoi import AOI
-import pupil_labs.marker_mapper.surface as surface
-
-from masks import AoiMaskConfig, AoiRegion, load_aoi_mask_config
 
 logging.basicConfig(
     level=logging.INFO,
@@ -77,13 +72,6 @@ AOI_CONFIG: dict[str, list[int]] = {
     "Screen":      [12, 13, 14, 15],
 }
 
-# (u_min, u_max, v_min, v_max) inside the normalized Screen polygon.
-# u: left -> right, v: top -> bottom.
-# Points_Bar / Progress_Bar / Avatar were removed — they are not the current
-# gamification elements. Real screen task/gamification zones live in
-# App/config/screen_zones.json and are wired in as part of the surface redesign.
-SUB_AOIS_PROPORTIONS: dict[str, tuple[float, float, float, float]] = {}
-
 AOI_COLORS: dict[str, tuple[int, int, int]] = {
     "Board":       (  0, 200, 255),   # orange
     "Left_Box":    (  0, 255,   0),   # green
@@ -97,7 +85,6 @@ DEFAULT_COLOR = (180, 180, 180)
 GENERATE_VIDEO       = True
 VIDEO_SCALE          = 0.5    # 0.5 = 800×600 for Neon's 1600×1200
 SCANPATH_HISTORY     = 5
-FALLBACK_POLYGON_SCALE = 1.08
 
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -227,13 +214,6 @@ def _stream_detections(frames, gaze_samps):
 
 # ── Geometry & Hit-Test Helpers ───────────────────────────────────────────────
 
-def make_camera(recording: nr.NeonRecording) -> Camera:
-    cal = recording.calibration
-    return Camera(1600, 1200,
-                  cal.scene_camera_matrix,
-                  cal.scene_distortion_coefficients)
-
-
 def sample_gaze(recording: nr.NeonRecording, scene_ts):
     """Gaze aligned to each scene timestamp.
 
@@ -254,188 +234,6 @@ def sample_gaze(recording: nr.NeonRecording, scene_ts):
         choose_left = np.abs(gts[left] - st) <= np.abs(gts[idx] - st)
         return gd[np.where(choose_left, left, idx)].view(np.recarray)
     return recording.gaze.sample(scene_ts)
-
-def get_expanded_surface_boundary(s2i: np.ndarray, camera: Camera, scale: float = 1.10, n: int = 10) -> np.ndarray:
-    """Gets the 2D pixel boundary of the surface, expanded outward by 'scale' to capture edge-gaze."""
-    norm_boundary = surface.normalized_boundary_points(n)
-    centroid = np.array([0.5, 0.5])
-    expanded_norm = centroid + (norm_boundary - centroid) * scale
-    undist = perspective_transform(expanded_norm, s2i)
-    return camera.distort_points(undist).astype(np.float32)
-
-def get_sub_aoi_polygon(s2i: np.ndarray, camera: Camera, u_min: float, u_max: float, v_min: float, v_max: float) -> np.ndarray:
-    norm_pts = np.array([
-        [u_min, v_min],
-        [u_max, v_min],
-        [u_max, v_max],
-        [u_min, v_max]
-    ], dtype=np.float32)
-    undist_pts = perspective_transform(norm_pts, s2i)
-    return camera.distort_points(undist_pts).astype(np.float32)
-
-def _contains_gaze_polygon(corners_px: np.ndarray, gx: float, gy: float) -> bool:
-    pts = corners_px.reshape(-1, 1, 2).astype(np.float32)
-    return cv2.pointPolygonTest(pts, (float(gx), float(gy)), False) >= 0
-
-
-def normalize_quad_corners(poly: np.ndarray) -> np.ndarray:
-    """Return quad corners as top-left, top-right, bottom-right, bottom-left."""
-    pts = np.asarray(poly, dtype=np.float32).reshape(-1, 2)
-    if len(pts) != 4:
-        return pts
-    sums = pts.sum(axis=1)
-    diffs = pts[:, 0] - pts[:, 1]
-    return np.array(
-        [
-            pts[np.argmin(sums)],
-            pts[np.argmax(diffs)],
-            pts[np.argmax(sums)],
-            pts[np.argmin(diffs)],
-        ],
-        dtype=np.float32,
-    )
-
-
-def _scale_polygon(poly: np.ndarray, scale: float) -> np.ndarray:
-    pts = np.asarray(poly, dtype=np.float32).reshape(-1, 2)
-    if len(pts) < 3 or scale == 1.0:
-        return pts
-    center = pts.mean(axis=0)
-    return center + (pts - center) * scale
-
-
-
-class OpticalFlowTracker:
-    """Tracks a 2D polygon using Lucas-Kanade optical flow."""
-    def __init__(self, max_points: int = 100, quality: float = 0.05, min_dist: float = 5.0):
-        self.max_points = max_points
-        self.quality = quality
-        self.min_dist = min_dist
-        self.prev_gray = None
-        self.tracked_pts = None
-        self.prev_poly = None
-        import cv2
-        self.lk_params = dict(winSize=(21, 21), maxLevel=3, criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01))
-        
-    def reset(self):
-        self.prev_gray = None
-        self.tracked_pts = None
-        self.prev_poly = None
-        
-    def initialize(self, gray, poly):
-        import numpy as np
-        import cv2
-        mask = np.zeros_like(gray)
-        cv2.fillPoly(mask, [poly.astype(np.int32)], 255)
-        pts = cv2.goodFeaturesToTrack(gray, maxCorners=self.max_points, qualityLevel=self.quality, minDistance=self.min_dist, mask=mask)
-        if pts is not None and len(pts) >= 4:
-            self.prev_gray = gray.copy()
-            self.tracked_pts = pts
-            self.prev_poly = poly.copy()
-            return True
-        return False
-        
-    def track(self, gray):
-        import numpy as np
-        import cv2
-        if self.prev_gray is None or self.tracked_pts is None or len(self.tracked_pts) < 4: return None
-        new_pts, status, err = cv2.calcOpticalFlowPyrLK(self.prev_gray, gray, self.tracked_pts, None, **self.lk_params)
-        good_new = new_pts[status == 1]
-        good_old = self.tracked_pts[status == 1]
-        if len(good_new) < 4:
-            self.reset(); return None
-        H, _ = cv2.findHomography(good_old, good_new, cv2.RANSAC, 3.0)
-        if H is None:
-            self.reset(); return None
-        poly_reshaped = self.prev_poly.reshape(-1, 1, 2).astype(np.float32)
-        new_poly = cv2.perspectiveTransform(poly_reshaped, H).reshape(-1, 2)
-        self.prev_gray = gray.copy()
-        self.tracked_pts = good_new.reshape(-1, 1, 2)
-        self.prev_poly = new_poly
-        return new_poly
-
-
-def get_fallback_aoi_polygon(detections: list, aoi_ids: list[int]) -> np.ndarray | None:
-    """Build a 2D polygon from visible markers when 3D surface mapping is not ready."""
-    found_dets = [d for d in detections if d.tag_id in aoi_ids]
-    found = {d.tag_id: np.asarray(d.center, dtype=np.float32) for d in found_dets}
-    n_found = len(found)
-    if n_found == 0:
-        return None
-
-    if len(aoi_ids) == 4:
-        if n_found >= 3:
-            pts = np.array(list(found.values()), dtype=np.float32).reshape(-1, 2)
-            if n_found == 3:
-                pairs = [(0, 1), (0, 2), (1, 2)]
-                i, j = max(pairs, key=lambda pair: float(np.linalg.norm(pts[pair[0]] - pts[pair[1]])))
-                k = ({0, 1, 2} - {i, j}).pop()
-                pts = np.vstack([pts, pts[i] + pts[j] - pts[k]])
-            return _scale_polygon(normalize_quad_corners(pts), FALLBACK_POLYGON_SCALE)
-
-        if n_found == 2:
-            all_corners = []
-            for det in found_dets:
-                all_corners.extend(det.corners)
-            hull = cv2.convexHull(np.array(all_corners, dtype=np.float32)).reshape(-1, 2)
-            return _scale_polygon(hull, FALLBACK_POLYGON_SCALE)
-
-    if len(aoi_ids) == 2 and n_found >= 2:
-        all_corners = []
-        for det in found_dets:
-            all_corners.extend(det.corners)
-        hull = cv2.convexHull(np.array(all_corners, dtype=np.float32)).reshape(-1, 2)
-        return _scale_polygon(hull, FALLBACK_POLYGON_SCALE)
-
-    return None
-
-
-def _surface_xy_from_image_quad(poly: np.ndarray, gx: float, gy: float) -> np.ndarray | None:
-    pts = normalize_quad_corners(poly)
-    if len(pts) != 4 or not (np.isfinite(gx) and np.isfinite(gy)):
-        return None
-    transform = cv2.getPerspectiveTransform(pts.astype(np.float32), surface.normalized_corners())
-    mapped = cv2.perspectiveTransform(np.array([[[gx, gy]]], dtype=np.float32), transform)
-    return mapped.reshape(2).astype(np.float64)
-
-
-def _project_norm_points_to_image_quad(norm_points: np.ndarray, poly: np.ndarray) -> np.ndarray | None:
-    pts = normalize_quad_corners(poly)
-    if len(pts) != 4:
-        return None
-    transform = cv2.getPerspectiveTransform(surface.normalized_corners(), pts.astype(np.float32))
-    projected = cv2.perspectiveTransform(norm_points.reshape(-1, 1, 2).astype(np.float32), transform)
-    return projected.reshape(-1, 2).astype(np.float32)
-
-
-def _project_region_outline(region: AoiRegion, s2i: np.ndarray, camera: Camera) -> np.ndarray | None:
-    norm_outline = region.normalized_outline()
-    if norm_outline is None or len(norm_outline) < 3:
-        return None
-    undist = perspective_transform(norm_outline, s2i)
-    return camera.distort_points(undist).astype(np.float32)
-
-
-def _project_region_outline_2d(region: AoiRegion, surface_poly: np.ndarray) -> np.ndarray | None:
-    norm_outline = region.normalized_outline()
-    if norm_outline is None or len(norm_outline) < 3:
-        return None
-    return _project_norm_points_to_image_quad(norm_outline, surface_poly)
-
-
-def _surface_gaze(
-    aoi: AOI,
-    gx: float,
-    gy: float,
-    camera: Camera,
-    img2surface: np.ndarray,
-) -> np.ndarray | None:
-    if not (np.isfinite(gx) and np.isfinite(gy)):
-        return None
-    try:
-        return aoi.map_gaze(np.array([gx, gy], dtype=np.float32), camera, img2surface)
-    except Exception:
-        return None
 
 
 # ── Drawing helpers ───────────────────────────────────────────────────────────
@@ -599,30 +397,7 @@ def analyze_recording(
     log.info("=" * 62)
 
     recording = nr.load(str(recording_dir))
-    camera    = make_camera(recording)
-    
-    aois = [AOI(name, ids) for name, ids in AOI_CONFIG.items()]
-    try:
-        mask_config: AoiMaskConfig = load_aoi_mask_config(CONFIG_DIR, SUB_AOIS_PROPORTIONS)
-    except Exception as exc:
-        log.warning("  Could not load aoi_masks.json (%s). Falling back to built-in Screen boxes.", exc)
-        mask_config = AoiMaskConfig([
-            AoiRegion(
-                name=name,
-                surface="Screen",
-                kind="bbox",
-                priority=10,
-                bounds=(float(u1), float(u2), float(v1), float(v2)),
-            )
-            for name, (u1, u2, v1, v2) in SUB_AOIS_PROPORTIONS.items()
-        ])
-
-    # Base AOIs + optional surface-space mask AOIs.
-    aoi_names = list(dict.fromkeys(list(AOI_CONFIG.keys()) + mask_config.names))
-    if mask_config.has_custom_config:
-        log.info("  AOI masks: %s", mask_config.config_path)
-    elif mask_config.names:
-        log.info("  AOI masks: using built-in Screen bbox defaults (%s)", ", ".join(mask_config.names))
+    aoi_names = list(AOI_CONFIG.keys())
 
     scene_ts   = recording.scene.time
     frames     = recording.scene.sample(scene_ts)
