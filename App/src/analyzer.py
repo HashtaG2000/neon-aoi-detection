@@ -722,6 +722,15 @@ def analyze_recording(
             write_summaries(out_dir, csv_path, recording_dir.name, fps)
         except Exception as exc:
             log.warning("  Could not write summary files: %s", exc)
+        # Auxiliary streams (pupillometry, eyelid, saccades, blinks, head motion,
+        # worn flag) + provenance. Additive; failure here must not lose the run.
+        try:
+            import metadata as _metadata
+            _metadata.augment_recording(recording_dir, force=True,
+                                        recording=recording, log=log,
+                                        csv_path=csv_path)
+        except Exception as exc:
+            log.warning("  Could not write recording metadata: %s", exc)
         if processing_path.exists():
             processing_path.unlink()
         log.info("  Done. Results saved in %s", out_dir)
