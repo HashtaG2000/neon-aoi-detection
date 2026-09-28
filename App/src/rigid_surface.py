@@ -65,6 +65,14 @@ SURFACE_DROP_PX = 30.0
 # Frames whose camera pose reprojects worse than this are too unreliable to attribute
 # gaze to any AOI (avoids phantom hits from a shaky pose).
 CAMERA_MAX_REPROJ_PX = 18.0
+# A pose fitted to too few markers is ill-conditioned: a single tag is four
+# coplanar points, so solvePnP reprojects it near-perfectly while leaving the
+# orientation poorly determined. Reprojection error alone therefore cannot
+# detect a bad pose -- it is lowest exactly where the pose is least constrained.
+# Surfaces showing >=2 of their own tags are fitted directly and never rely on
+# this, so the gate only guards the rigid-body fallback (most importantly the
+# Screen, whose distance from the anchor amplifies any orientation error).
+MIN_POSE_TAGS = 3
 # Widen each surface's boundary a touch so gaze right at the edges still counts.
 SURFACE_EXPAND = 1.06
 
@@ -492,12 +500,90 @@ def calibrate_scene(
             model.surface_tags["Screen"] = list(screen_tmpl)
             screen_placed = True
 
+    # 5. Joint refinement -----------------------------------------------------
+    # Everything above places surfaces by chaining relative poses out from the
+    # anchor, and the Screen by triangulation that depends on those same drifted
+    # camera poses. Refine all surface poses and all calibration camera poses
+    # together so the error is distributed by evidence instead of accumulating
+    # along the chain. Each surface stays rigid; the anchor holds the gauge.
+    ba_report = None
+    try:
+        import bundle_adjust
+        init_pose: dict[str, np.ndarray] = {}
+        for surf in model.surface_tags:
+            tmpl = templates.get(surf)
+            if not tmpl:
+                continue
+            src, dst = [], []
+            for t, local in tmpl.items():
+                wc = model.world_tag_corners.get(t)
+                if wc is not None:
+                    src.append(local)
+                    dst.append(wc)
+            if src:
+                init_pose[surf] = _kabsch(np.vstack(src), np.vstack(dst))
+        # The Screen's triangulated placement inherits every error in the camera
+        # poses that produced it, and being far from the anchor it can end up
+        # wildly wrong -- a bad starting point that the refinement cannot escape.
+        # Whenever the Screen shows >=2 of its own tags we can measure its pose
+        # against the anchor directly in that same frame, which is far more
+        # reliable, so prefer that as the starting estimate.
+        if "Screen" in templates and anchor in init_pose:
+            rels = []
+            for fr in frames:
+                pa = surf_pose(anchor, fr, min_tags=2)
+                ps = surf_pose("Screen", fr, min_tags=2)
+                if pa is not None and ps is not None:
+                    rels.append(np.linalg.inv(pa) @ ps)
+            if len(rels) >= 3:
+                init_pose["Screen"] = init_pose[anchor] @ _robust_se3(rels)
+                _log(f"  Screen initialised from {len(rels)} direct anchor-relative views")
+
+        if anchor in init_pose and len(init_pose) >= 2:
+            out = bundle_adjust.refine_scene(
+                templates=templates, surface_world_pose=init_pose, frames=frames,
+                K=K, D=D, anchor=anchor, log=log)
+            if out is not None:
+                refined, ba_report = out
+                for surf, W in refined.items():
+                    _place(surf, W)
+
+                # Second stage: let each marker depart from its nominal position
+                # on the surface rectangle, which absorbs hand-placement error
+                # the rigid surface pose cannot. The anchor's markers stay fixed
+                # so the world frame and scale are preserved.
+                anchor_tags = set(templates.get(anchor, {}))
+                tag_out = bundle_adjust.refine_tags(
+                    world_tag_corners=dict(model.world_tag_corners),
+                    fixed_tags=anchor_tags, frames=frames, K=K, D=D,
+                    tag_local=np.hstack([_TAG_CORNERS_LOCAL, np.zeros((4, 1))]),
+                    log=log)
+                if tag_out is not None:
+                    tags_refined, tag_report = tag_out
+                    model.world_tag_corners.update(tags_refined)
+                    ba_report["per_marker"] = tag_report
+                    # Re-fit each surface boundary to its refined markers so the
+                    # AOI quad follows the corrected geometry.
+                    for surf, tmpl in templates.items():
+                        if surf not in model.surface_quad_world:
+                            continue
+                        src, dst = [], []
+                        for t, local in tmpl.items():
+                            if t in tags_refined:
+                                src.append(local)
+                                dst.append(tags_refined[t])
+                        if len(src) >= 2:
+                            _place(surf, _kabsch(np.vstack(src), np.vstack(dst)))
+    except Exception as exc:                        # never lose a calibration to this
+        _log(f"  Bundle adjustment skipped: {type(exc).__name__}: {exc}")
+
     model.placed = list(model.surface_quad_world)
     model.calib_report = {
         "placed_surfaces": model.placed,
         "screen_placed": screen_placed,
         "anchor": anchor,
         "n_calib_frames": len(frames),
+        "bundle_adjustment": ba_report,
     }
     _log(f"  Rigid-body calibration: placed {model.placed} (screen={'yes' if screen_placed else 'NO'})")
     return model

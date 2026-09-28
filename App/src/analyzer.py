@@ -612,7 +612,9 @@ def analyze_recording(
                 # proper rectangle when you look at it); otherwise it falls back to the
                 # rigid-body projection from a well-constrained whole-rig camera pose.
                 loc = scene_model.localize(detections)
-                good_pose = loc is not None and loc[2] <= rigid_surface.CAMERA_MAX_REPROJ_PX
+                good_pose = (loc is not None
+                             and loc[2] <= rigid_surface.CAMERA_MAX_REPROJ_PX
+                             and loc[3] >= rigid_surface.MIN_POSE_TAGS)
                 cam_rvec = loc[0] if good_pose else None
                 cam_tvec = loc[1] if good_pose else None
                 if True:
