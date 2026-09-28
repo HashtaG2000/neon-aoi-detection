@@ -1,0 +1,20 @@
+{
+  "_comment": "Recordings excluded from aggregate and between-condition analysis. Each entry records the objective criterion that triggered exclusion so the decision is reproducible and auditable. Excluding a recording here removes it from every aggregate, per-condition export and comparison statistic. Set 'enabled' to false to re-include everything without deleting the rationale.",
+  "enabled": true,
+  "excluded": [
+    {
+      "recording": "96ARP",
+      "condition": "Gamified",
+      "criterion": "fixations_per_minute < 50",
+      "measured": {
+        "fixations_per_minute": 8.3,
+        "cohort_median_fixations_per_minute": 125.5,
+        "cohort_p5_fixations_per_minute": 102.8,
+        "fixation_count": 107,
+        "duration_s": 774
+      },
+      "reason": "Fixation-detection failure. The recording yields 107 fixations over 774 s (8.3/min) against a cohort median of 125.5/min, roughly twelve times below the lowest otherwise-normal recording. The underlying gaze stream is intact (193.6 Hz sampling, 100 percent AOI coverage), so this reflects a failure of the device fixation/saccade detector rather than participant behaviour. Any fixation-count or fixation-duration metric derived from this recording is invalid.",
+      "excluded_on": "2026-09-28"
+    }
+  ]
+}

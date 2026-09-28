@@ -90,12 +90,54 @@ def generate_master_outputs(source_dir: pathlib.Path) -> MasterOutput:
     )
 
 
+_EXCLUSIONS_CACHE: set[str] | None = None
+
+
+def load_excluded_recordings() -> set[str]:
+    """Recording names excluded from aggregate and comparison analysis.
+
+    Read from App/config/excluded_recordings.json, which records the objective
+    criterion behind each exclusion so the decision stays auditable. Missing or
+    malformed config means nothing is excluded.
+    """
+    global _EXCLUSIONS_CACHE
+    if _EXCLUSIONS_CACHE is not None:
+        return _EXCLUSIONS_CACHE
+    names: set[str] = set()
+    try:
+        cfg_path = pathlib.Path(__file__).resolve().parents[1] / "config" / "excluded_recordings.json"
+        if cfg_path.exists():
+            cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+            if cfg.get("enabled", True):
+                names = {str(e["recording"]) for e in cfg.get("excluded", [])
+                         if e.get("recording")}
+    except Exception:
+        names = set()
+    _EXCLUSIONS_CACHE = names
+    return names
+
+
+def excluded_recording_details() -> list[dict]:
+    """Full exclusion records (name, criterion, measurement, rationale)."""
+    try:
+        cfg_path = pathlib.Path(__file__).resolve().parents[1] / "config" / "excluded_recordings.json"
+        if cfg_path.exists():
+            cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+            if cfg.get("enabled", True):
+                return list(cfg.get("excluded", []))
+    except Exception:
+        pass
+    return []
+
+
 def _iter_recording_dirs(source_dir: pathlib.Path) -> Iterable[pathlib.Path]:
+    excluded = load_excluded_recordings()
     for path in sorted(source_dir.iterdir()):
         if (
             path.is_dir()
             and not path.name.startswith(".")
             and path.name != SUMMARY_DIR_NAME
+            and path.name not in excluded
             and (path / "info.json").exists()
         ):
             yield path
